@@ -294,11 +294,11 @@ async def scan_loop(session, symbols, tf):
             nonlocal alerts
             async with sem:
                 data = await bn_klines(session, sym, tf, limit=3)
-                if not data or len(data)<2: return
+                if not data or len(data)<3: 
+                    return
+                prev = data [-2]
                 last_closed = data[-1]
-                sig = 
-
-def detect_signal(sym, tf, last_closed_row, prev_row=None):
+                sig = detect_signal(sym, tf, last_closed, prev_row=prev):
     # last closed candle
     close_time = int(last_closed_row[6])
     o = float(last_closed_row[1])
@@ -365,7 +365,7 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None):
         return {"direction":"Short", "close":c, "open":o}
 
     return None
-                if not sig: return
+                
 
                 # --- Funding (must) ---
                 finfo = await bn_premium_index(session, sym)

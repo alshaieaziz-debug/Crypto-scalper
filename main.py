@@ -379,7 +379,6 @@ async def scan_loop(session, symbols, tf):
 alerts.append(
     format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
 )
-                alerts.append(format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, max(1, min(10, score))))
 
         await asyncio.gather(*(process(s) for s in symbols))
         for a in alerts:

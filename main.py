@@ -376,8 +376,7 @@ async def scan_loop(session, symbols, tf):
                 final_score = max(1, min(10, score))
                 if final_score < MIN_CONF:
                    return
-alerts.append(
-    format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
+                alerts.append( format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
 )
 
         await asyncio.gather(*(process(s) for s in symbols))

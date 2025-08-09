@@ -9,6 +9,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Tunables
 SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "30"))     # change to 100 after first run
+MIN_CONF = int(os.getenv("MIN_CONF", "8"))
 BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))     # 0.05% pad
 VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.25"))      # >=25% above 20-c avg
 OI_DELTA_MIN          = float(os.getenv("OI_DELTA_MIN", "0.02"))       # >=2% in last ~5m
@@ -371,6 +372,13 @@ async def scan_loop(session, symbols, tf):
                     score += 1
 
                 reason = ("Breakout + pad; " if sig['direction']=="Long" else "Breakdown + pad; ") + ", ".join(info_bits)
+                # Require high-confidence alerts only
+                final_score = max(1, min(10, score))
+                if final_score < MIN_CONF:
+                   return
+alerts.append(
+    format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
+)
                 alerts.append(format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, max(1, min(10, score))))
 
         await asyncio.gather(*(process(s) for s in symbols))

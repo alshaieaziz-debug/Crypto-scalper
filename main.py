@@ -8,11 +8,11 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Tunables
-SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))     # change to 100 after first run
-MIN_CONF = int(os.getenv("MIN_CONF", "8"))
-BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))     # 0.05% pad
+SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))      # try 120–150 first; then 175–200 if stable
+MIN_CONF              = int(os.getenv("MIN_CONF", "8"))          # min confidence to alert
+BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))      # 0.05% pad
 VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.25"))      # >=25% above 20-c avg
-OI_DELTA_MIN          = float(os.getenv("OI_DELTA_MIN", "0.02"))       # >=2% in last ~5m
+OI_DELTA_MIN          = float(os.getenv("OI_DELTA_MIN", "0.02"))       # >=2% last ~5m
 FUNDING_MAX_ABS       = float(os.getenv("FUNDING_MAX_ABS", "0.0005"))  # ±0.05%
 SPREAD_MAX_ABS        = float(os.getenv("SPREAD_MAX_ABS", "0.0006"))   # 0.06%
 DEPTH_1PCT_MIN_USD    = float(os.getenv("DEPTH_1PCT_MIN_USD", "20000"))# combined depth within 1%
@@ -62,10 +62,6 @@ async def tg_send(session, text):
     except Exception as e:
         print("Telegram exception:", e)
 
-def pct(a,b): 
-    try: return (a-b)/b
-    except ZeroDivisionError: return 0.0
-
 def next_close_ms(tf):
     s = int(time.time())
     if tf=="1m":  return (s - (s%60) + 60)*1000
@@ -80,7 +76,7 @@ def swing_levels(lows, highs):
 def rr_ok(entry, sl, tp_mult=1.5):
     if sl is None: return False
     risk = abs(entry - sl)
-    return risk > 0 and (tp_mult*risk) / risk >= 1.2  # always true if tp_mult>=1.2, kept for clarity
+    return risk > 0 and (tp_mult*risk) / risk >= 1.2
 
 def format_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score):
     return (
@@ -118,21 +114,18 @@ async def bn_depth(session, symbol, limit=50):
 # ========= OPTIONAL: COINGLASS OI =========
 async def cg_open_interest_delta5m(session, symbol, exch="BINANCE"):
     if not COINGLASS_API_KEY:
-        return None  # no key, soft-fail upstream
-    # Placeholder: adjust to your Coinglass endpoint
-    # Here we simply return None if call fails; you can wire their exact path once you have a key.
+        return None
     headers = {"coinglassSecret": COINGLASS_API_KEY}
-    # Example (not guaranteed): /api/v2/open_interest?symbol=BTC&exchange=BINANCE
-    j = await http_json(session, "https://open-api.coinglass.com/api/futures/openInterest", 
-                        params={"symbol": symbol.replace("USDT",""), "exchange": exch}, headers=headers, timeout=12)
-    if not j: return None
-    # Expect the response to include recent OI history… you’d compute 5m %Δ here.
-    return None  # keep None until you plug the exact fields
+    j = await http_json(session, "https://open-api.coinglass.com/api/futures/openInterest",
+                        params={"symbol": symbol.replace("USDT",""), "exchange": exch},
+                        headers=headers, timeout=12)
+    # TODO: compute 5m %Δ from their response once field names confirmed.
+    return None
 
 # ========= DISCOVERY =========
 async def discover_top_usdt_perps(session, limit):
     info = await bn_exchange_info(session)
-    if not info: 
+    if not info:
         raise RuntimeError("exchangeInfo failed")
     perp_symbols = {s['symbol'] for s in info['symbols']
                     if s.get('contractType')=='PERPETUAL' and s.get('quoteAsset')=='USDT'}
@@ -220,7 +213,6 @@ def session_soft_flag(tf, closes):
     if len(closes) < 20: return True  # cautious
     rets = [abs((closes[i]-closes[i-1])/closes[i-1]) for i in range(1,len(closes))]
     atrp = sum(rets[-20:])/20.0
-    # rough thresholds
     th = {"1m":0.0015, "5m":0.0035, "15m":0.0060}.get(tf, 0.003)
     return atrp < th
 
@@ -230,9 +222,8 @@ def depth_checks(orderbook, price):
         best_ask = float(orderbook['asks'][0][0])
         best_bid = float(orderbook['bids'][0][0])
         spread = (best_ask - best_bid) / ((best_ask + best_bid)/2)
-        if spread > SPREAD_MAX_ABS: 
+        if spread > SPREAD_MAX_ABS:
             return False, spread, 0.0
-        # 1% depth (USD)
         up_lim  = best_ask * 1.01
         dn_lim  = best_bid * 0.99
         ask_usd = sum(float(p)*float(q) for p,q in orderbook['asks'] if float(p)<=up_lim)
@@ -244,67 +235,12 @@ def depth_checks(orderbook, price):
     except Exception:
         return False, 1.0, 0.0
 
-# ========= PRICE ACTION + VOL =========
-def detect_signal(sym, tf, last_closed_row):
-    close_time = int(last_closed_row[6])
-    open_ = float(last_closed_row[1])
-    close = float(last_closed_row[4])
-    high  = float(last_closed_row[2])
-    low   = float(last_closed_row[3])
-    vol   = float(last_closed_row[5])
-
-    buf = kbuf[sym][tf]
-    if buf['last_close'] and close_time <= buf['last_close']: return None
-    if len(buf['vol']) < 20: return None
-
-    avg_vol = sum(buf['vol'])/len(buf['vol'])
-    vol_ok  = vol >= avg_vol * VOL_SURGE_MIN
-
-    range_hi = max(buf['hi']) if buf['hi'] else None
-    range_lo = min(buf['lo']) if buf['lo'] else None
-    if range_hi is None or range_lo is None: return None
-
-    pad = BREAKOUT_PAD_BPS/10000.0
-    long_break  = close > range_hi*(1+pad)
-    short_break = close < range_lo*(1-pad)
-
-    # Always update buffers
-    buf['hi'].append(high); buf['lo'].append(low); buf['vol'].append(vol); buf['cl'].append(close); buf['last_close']=close_time
-    if len(buf['cl'])>21: buf['cl'].popleft()
-
-    if not vol_ok: return None
-    if not (long_break or short_break): 
-        # (Would add reversal/engulfing logic here later if needed)
-        return None
-
-    direction = "Long" if long_break else "Short"
-    return {"direction":direction, "close":close, "open":open_}
-
-# ========= SCAN LOOP PER TF =========
-async def scan_loop(session, symbols, tf):
-    while True:
-        await asyncio.sleep(max(0, next_close_ms(tf) - now_ms() + 500)/1000)
-        if not macro_ok(): 
-            continue
-
-        sem = asyncio.Semaphore(6)
-        alerts = []
-
-        async def process(sym):
-            nonlocal alerts
-            async with sem:
-                data = await bn_klines(session, sym, tf, limit=3)
-                if not data or len(data)<3: 
-                    return
-                prev = data [-2]
-                last_closed = data[-1]
-                sig = detect_signal(sym, tf, last_closed, prev_row=prev):
+# ========= PRICE ACTION + VOL (+ REVERSAL) =========
+def detect_signal(sym, tf, last_closed_row, prev_row=None):
     # last closed candle
     close_time = int(last_closed_row[6])
-    o = float(last_closed_row[1])
-    c = float(last_closed_row[4])
-    h = float(last_closed_row[2])
-    l = float(last_closed_row[3])
+    o = float(last_closed_row[1]); c = float(last_closed_row[4])
+    h = float(last_closed_row[2]); l = float(last_closed_row[3])
     v = float(last_closed_row[5])
 
     # previous candle (for engulfing)
@@ -334,12 +270,10 @@ async def scan_loop(session, symbols, tf):
     # ---- Engulfing after sweep (reversal) ----
     bull_engulf = bear_engulf = False
     if prev_row is not None:
-        # bodies
         prev_bear = pc < po
         prev_bull = pc > po
         body_engulf_up   = (c > o) and prev_bear and (c >= po) and (o <= pc)
         body_engulf_down = (c < o) and prev_bull and (c <= po) and (o >= pc)
-        # sweeps of the prior 10 bars (use buffers)
         lo10 = min(list(buf['lo'])[-10:]) if len(buf['lo']) else None
         hi10 = max(list(buf['hi'])[-10:]) if len(buf['hi']) else None
         sweep_down = (lo10 is not None) and (l <= lo10)
@@ -358,14 +292,34 @@ async def scan_loop(session, symbols, tf):
         direction = "Long" if long_break else "Short"
         return {"direction":direction, "close":c, "open":o}
 
-    # Reversal path (if no breakout)
     if bull_engulf:
         return {"direction":"Long", "close":c, "open":o}
     if bear_engulf:
         return {"direction":"Short", "close":c, "open":o}
 
     return None
-                
+
+# ========= SCAN LOOP PER TF =========
+async def scan_loop(session, symbols, tf):
+    while True:
+        await asyncio.sleep(max(0, next_close_ms(tf) - now_ms() + 500)/1000)
+        if not macro_ok():
+            continue
+
+        sem = asyncio.Semaphore(6)
+        alerts = []
+
+        async def process(sym):
+            nonlocal alerts
+            async with sem:
+                data = await bn_klines(session, sym, tf, limit=3)
+                if not data or len(data)<3:
+                    return
+                prev = data[-2]
+                last_closed = data[-1]
+                sig = detect_signal(sym, tf, last_closed, prev_row=prev)
+                if not sig:
+                    return
 
                 # --- Funding (must) ---
                 finfo = await bn_premium_index(session, sym)
@@ -377,7 +331,6 @@ async def scan_loop(session, symbols, tf):
                 oi_pct = oi_5min_change_pct(sym)
                 oi_soft_fail = False
                 if oi_pct is None:
-                    # try Coinglass if key present (placeholder returns None until wired)
                     cg = await cg_open_interest_delta5m(session, sym)
                     oi_pct = cg
                 if oi_pct is None or abs(oi_pct) < OI_DELTA_MIN:
@@ -387,7 +340,7 @@ async def scan_loop(session, symbols, tf):
                 ob = await bn_depth(session, sym, limit=100)
                 price = sig['close']
                 ok_depth, spread, depth_usd = depth_checks(ob, price)
-                if not ok_depth: 
+                if not ok_depth:
                     return
 
                 # --- RR check (must) ---
@@ -395,11 +348,17 @@ async def scan_loop(session, symbols, tf):
                 sl_long, sl_short = swing_levels(buf['lo'], buf['hi'])
                 entry = sig['close']
                 if sig['direction']=="Long" and sl_long is not None:
-                    if not rr_ok(entry, sl_long): 
-                        return
+                    if not rr_ok(entry, sl_long): return
+                    sl = sl_long
+                    risk = max(1e-9, entry - sl)
+                    tp1, tp2 = entry + 0.75*risk, entry + 1.50*risk
+                    reason_prefix = "Breakout + pad" if entry > max(buf['cl']) else "Engulfing reversal + sweep"
                 elif sig['direction']=="Short" and sl_short is not None:
-                    if not rr_ok(entry, sl_short):
-                        return
+                    if not rr_ok(entry, sl_short): return
+                    sl = sl_short
+                    risk = max(1e-9, sl - entry)
+                    tp1, tp2 = entry - 0.75*risk, entry - 1.50*risk
+                    reason_prefix = "Breakdown + pad" if entry < min(buf['cl']) else "Engulfing reversal + sweep"
                 else:
                     return
 
@@ -414,17 +373,8 @@ async def scan_loop(session, symbols, tf):
                 if now_s - last_alert_at[sym][tf] < 60: return
                 last_alert_at[sym][tf] = now_s
 
-                # --- Build TP/SL + score ---
-                if sig['direction']=="Long":
-                    sl = sl_long
-                    risk = max(1e-9, entry - sl)
-                    tp1, tp2 = entry + 0.75*risk, entry + 1.50*risk
-                else:
-                    sl = sl_short
-                    risk = max(1e-9, sl - entry)
-                    tp1, tp2 = entry - 0.75*risk, entry - 1.50*risk
-
-                score = 6  # core musts passed to reach here
+                # --- Score ---
+                score = 6  # core musts passed
                 info_bits = [f"Vol≥{VOL_SURGE_MIN:.2f}x", f"Funding {fr*100:.3f}%", f"Spread {spread*100:.2f}%", f"Depth1% ${depth_usd:,.0f}"]
                 if oi_soft_fail:
                     score -= 1; info_bits.append("OI soft-fail")
@@ -439,13 +389,16 @@ async def scan_loop(session, symbols, tf):
                 else:
                     score += 1
 
-                reason = ("Breakout + pad; " if sig['direction']=="Long" else "Breakdown + pad; ") + ", ".join(info_bits)
-                # Require high-confidence alerts only
+                reason = f"{reason_prefix}; " + ", ".join(info_bits)
+
+                # confidence gate
                 final_score = max(1, min(10, score))
                 if final_score < MIN_CONF:
-                   return
-                alerts.append( format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
-)
+                    return
+
+                alerts.append(
+                    format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
+                )
 
         await asyncio.gather(*(process(s) for s in symbols))
         for a in alerts:

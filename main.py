@@ -8,45 +8,45 @@ from datetime import datetime, timezone, timedelta
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Tunables (core)
-SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))      # start 120–150; bump if stable
-MIN_CONF              = int(os.getenv("MIN_CONF", "8"))          # min confidence to alert
+# ========= TUNABLES (defaults tuned for 15m/30m/1h) =========
+SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "120"))      # number of symbols to scan
+MIN_CONF              = int(os.getenv("MIN_CONF", "7"))          # min confidence to alert
 BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))      # 0.05% pad
-VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.25"))      # >=25% above 20-c avg
-OI_DELTA_MIN          = float(os.getenv("OI_DELTA_MIN", "0.02"))       # >=2% last ~5m
+VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.30"))      # >=30% above 20-c avg
+OI_DELTA_MIN          = float(os.getenv("OI_DELTA_MIN", "0.025"))      # >=2.5% last ~5m
 FUNDING_MAX_ABS       = float(os.getenv("FUNDING_MAX_ABS", "0.0005"))  # ±0.05%
-SPREAD_MAX_ABS        = float(os.getenv("SPREAD_MAX_ABS", "0.0006"))   # 0.06%
-DEPTH_1PCT_MIN_USD    = float(os.getenv("DEPTH_1PCT_MIN_USD", "20000"))# combined depth within 1%
-MACRO_BTC_SHOCK_BP    = float(os.getenv("MACRO_BTC_SHOCK_BP", "180"))  # 1.8% 1m shock bars
-MACRO_COOLDOWN_SEC    = int(os.getenv("MACRO_COOLDOWN_SEC", "600"))    # 10 min pause
+SPREAD_MAX_ABS        = float(os.getenv("SPREAD_MAX_ABS", "0.0005"))   # 0.05%
+DEPTH_1PCT_MIN_USD    = float(os.getenv("DEPTH_1PCT_MIN_USD", "40000"))# combined depth within 1%
+MACRO_BTC_SHOCK_BP    = float(os.getenv("MACRO_BTC_SHOCK_BP", "150"))  # 1.5% 1m shock bars
+MACRO_COOLDOWN_SEC    = int(os.getenv("MACRO_COOLDOWN_SEC", "900"))    # 15 min pause
 NEWS_PAUSE            = os.getenv("NEWS_PAUSE","false").lower() == "true"
 COINGLASS_API_KEY     = os.getenv("COINGLASS_API_KEY","")              # optional
 
 # A-tier extras (env-controlled)
 HARD_REQUIRE_OI   = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
 CORR_HARD_BLOCK   = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
-COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC","180"))     # per pair/tf alert cooldown
-MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.008")) # 0.8% max stop distance
+COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC","600"))     # per pair/tf alert cooldown (10 min)
+MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.006")) # 0.6% max stop distance
 
 # Stats & reporting
-DEDUP_MIN          = int(os.getenv("DEDUP_MIN", "5"))         # within N minutes treat same idea as duplicate (stats only)
-WIN_TIMEOUT_MIN    = int(os.getenv("WIN_TIMEOUT_MIN", "90"))  # stop monitoring a trade after N minutes if neither TP/SL hits
+DEDUP_MIN          = int(os.getenv("DEDUP_MIN", "5"))         # treat near-duplicate alerts as one (stats)
+WIN_TIMEOUT_MIN    = int(os.getenv("WIN_TIMEOUT_MIN", "240")) # 4h timeout per trade
 STATS_DAILY_HOUR   = int(os.getenv("STATS_DAILY_HOUR", "22")) # 22:00 Riyadh (UTC+3)
 
 # ========= CONSTANTS =========
 BINANCE_BASE = "https://fapi.binance.com"
 RIYADH_TZ = timezone(timedelta(hours=3))  # no DST
+TIMEFRAMES = ["15m","30m","1h"]
 
 # ========= STATE =========
 kbuf = defaultdict(lambda: {
-    '1m':  {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
-    '5m':  {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
     '15m': {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
+    '30m': {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
+    '1h':  {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
 })
 oi_hist = defaultdict(lambda: deque(maxlen=10))  # symbol -> [(ts_ms, oi_float)]
-last_alert_at = defaultdict(lambda: {'1m':0,'5m':0,'15m':0})
+last_alert_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
 macro_block_until = 0
-TIMEFRAMES = ["1m","5m","15m"]
 
 # Stats structures
 stats = {"unique": 0, "wins": 0, "losses": 0}
@@ -55,7 +55,6 @@ active_trades = {}               # trade_id -> dict(entry, sl, tp1, direction, s
 current_day_keys = set()         # trade keys created since last daily digest
 
 def trade_key(sym, tf, direction, entry):
-    # round entry to 5 dp to collapse near-duplicates
     return f"{sym}|{tf}|{direction}|{round(entry,5)}"
 
 # ========= HELPERS =========
@@ -93,9 +92,11 @@ async def tg_send(session, text):
 
 def next_close_ms(tf):
     s = int(time.time())
-    if tf=="1m":  return (s - (s%60) + 60)*1000
-    if tf=="5m":  return (s - (s%300) + 300)*1000
-    if tf=="15m": return (s - (s%900) + 900)*1000
+    if tf=="1m":   return (s - (s%60)   + 60)*1000
+    if tf=="5m":   return (s - (s%300)  + 300)*1000
+    if tf=="15m":  return (s - (s%900)  + 900)*1000
+    if tf=="30m":  return (s - (s%1800) + 1800)*1000
+    if tf=="1h":   return (s - (s%3600) + 3600)*1000
 
 def swing_levels(lows, highs):
     sl_long = min(list(lows)[-3:]) if len(lows)>=3 else (min(lows) if lows else None)
@@ -143,6 +144,8 @@ def format_stats_line():
     return f"Unique Alerts: {total} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"
 
 # ========= BINANCE WRAPPERS =========
+BINANCE_BASE = "https://fapi.binance.com"
+
 async def bn_exchange_info(session):
     return await http_json(session, f"{BINANCE_BASE}/fapi/v1/exchangeInfo")
 
@@ -159,7 +162,7 @@ async def bn_open_interest(session, symbol):
 async def bn_premium_index(session, symbol):
     return await http_json(session, f"{BINANCE_BASE}/fapi/v1/premiumIndex", params={"symbol":symbol})
 
-async def bn_depth(session, symbol, limit=50):
+async def bn_depth(session, symbol, limit=100):
     return await http_json(session, f"{BINANCE_BASE}/fapi/v1/depth", params={"symbol":symbol,"limit":limit})
 
 async def bn_book_ticker(session, symbol):
@@ -267,7 +270,7 @@ def session_soft_flag(tf, closes):
     if len(closes) < 20: return True  # cautious
     rets = [abs((closes[i]-closes[i-1])/closes[i-1]) for i in range(1,len(closes))]
     atrp = sum(rets[-20:])/20.0
-    th = {"1m":0.0015, "5m":0.0035, "15m":0.0060}.get(tf, 0.003)
+    th = {"15m":0.0060, "30m":0.0090, "1h":0.0130}.get(tf, 0.009)
     return atrp < th
 
 # ========= SPREAD & DEPTH (MUST) =========
@@ -291,13 +294,11 @@ def depth_checks(orderbook, price):
 
 # ========= PRICE ACTION + VOL (+ REVERSAL) =========
 def detect_signal(sym, tf, last_closed_row, prev_row=None):
-    # last closed candle
     close_time = int(last_closed_row[6])
     o = float(last_closed_row[1]); c = float(last_closed_row[4])
     h = float(last_closed_row[2]); l = float(last_closed_row[3])
     v = float(last_closed_row[5])
 
-    # previous candle (for engulfing)
     po = pc = ph = pl = None
     if prev_row:
         po = float(prev_row[1]); pc = float(prev_row[4])
@@ -321,7 +322,7 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None):
     long_break  = c > range_hi*(1+pad)
     short_break = c < range_lo*(1-pad)
 
-    # ---- Engulfing after sweep (reversal) ----
+    # Engulfing after sweep (reversal)
     bull_engulf = bear_engulf = False
     if prev_row is not None:
         prev_bear = pc < po
@@ -345,12 +346,10 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None):
     if long_break or short_break:
         direction = "Long" if long_break else "Short"
         return {"direction":direction, "close":c, "open":o}
-
     if bull_engulf:
         return {"direction":"Long", "close":c, "open":o}
     if bear_engulf:
         return {"direction":"Short", "close":c, "open":o}
-
     return None
 
 # ========= SCAN LOOP PER TF =========
@@ -375,13 +374,13 @@ async def scan_loop(session, symbols, tf):
                 if not sig:
                     return
 
-                # --- Funding (must) ---
+                # Funding (must)
                 finfo = await bn_premium_index(session, sym)
                 if not finfo or 'lastFundingRate' not in finfo: return
                 fr = float(finfo['lastFundingRate'])
                 if abs(fr) > FUNDING_MAX_ABS: return
 
-                # --- OI (soft if missing) ---
+                # OI (soft if missing)
                 oi_pct = oi_5min_change_pct(sym)
                 oi_soft_fail = False
                 if oi_pct is None:
@@ -392,14 +391,14 @@ async def scan_loop(session, symbols, tf):
                 if HARD_REQUIRE_OI and oi_soft_fail:
                     return
 
-                # --- Spread & depth (must) ---
+                # Spread & depth (must)
                 ob = await bn_depth(session, sym, limit=100)
                 price = sig['close']
                 ok_depth, spread, depth_usd = depth_checks(ob, price)
                 if not ok_depth:
                     return
 
-                # --- RR & SL sanity (must) ---
+                # RR & SL sanity (must)
                 buf = kbuf[sym][tf]
                 sl_long, sl_short = swing_levels(buf['lo'], buf['hi'])
                 entry = sig['close']
@@ -424,7 +423,7 @@ async def scan_loop(session, symbols, tf):
                 if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
                     return
 
-                # --- Correlation (soft / hard block option) ---
+                # Correlation (soft / hard block option)
                 corr_soft, btc5m, eth5m = await correlation_soft_flag(session, sig['direction'])
                 if CORR_HARD_BLOCK:
                     if sig['direction']=="Long" and (btc5m < -0.007 or eth5m < -0.007):
@@ -432,13 +431,13 @@ async def scan_loop(session, symbols, tf):
                     if sig['direction']=="Short" and (btc5m >  0.007 or eth5m >  0.007):
                         return
 
-                # --- Debounce per symbol/tf ---
+                # Debounce per symbol/tf
                 now_s = int(time.time())
                 if now_s - last_alert_at[sym][tf] < COOLDOWN_SEC: return
                 last_alert_at[sym][tf] = now_s
 
-                # --- Score ---
-                score = 6  # core musts passed
+                # Score
+                score = 6
                 info_bits = [f"Vol≥{VOL_SURGE_MIN:.2f}x", f"Funding {fr*100:.3f}%", f"Spread {spread*100:.2f}%", f"Depth1% ${depth_usd:,.0f}"]
                 if oi_soft_fail:
                     score -= 1; info_bits.append("OI soft-fail")
@@ -448,7 +447,6 @@ async def scan_loop(session, symbols, tf):
                     score -= 1; info_bits.append(f"Corr soft: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
                 else:
                     score += 1
-                # session softness
                 sess_soft = session_soft_flag(tf, list(buf['cl']))
                 if sess_soft:
                     score -= 1; info_bits.append("Session soft")
@@ -457,18 +455,16 @@ async def scan_loop(session, symbols, tf):
 
                 reason = f"{reason_prefix}; " + ", ".join(info_bits)
 
-                # confidence gate
                 final_score = max(1, min(10, score))
                 if final_score < MIN_CONF:
                     return
 
-                # Duplicate exclusion for stats (still send alert, but don't count duplicates)
+                # Dedup for stats (still send alert)
                 key = trade_key(sym, tf, sig['direction'], entry)
                 nowm = now_ms()
                 is_unique = True
-                # prune old dedup keys
                 while dedup_seen and nowm - dedup_seen[0][1] > DEDUP_MIN*60*1000:
-                    dedup_seen.pop(0)
+                    dedup_seen.popleft()
                 for k, ts in dedup_seen:
                     if k == key:
                         is_unique = False
@@ -476,14 +472,12 @@ async def scan_loop(session, symbols, tf):
                 if is_unique:
                     dedup_seen.append((key, nowm))
                     stats["unique"] += 1
-                    current_day_keys.add(key)  # track for today's digest
-                    # register active trade for resolution
+                    current_day_keys.add(key)
                     active_trades[key] = {
                         "symbol": sym, "tf": tf, "direction": sig['direction'],
                         "entry": entry, "sl": sl, "tp1": tp1, "start_ms": nowm
                     }
 
-                # queue alert
                 alerts.append(
                     format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
                 )
@@ -494,7 +488,6 @@ async def scan_loop(session, symbols, tf):
 
 # ========= RESULT RESOLVER (TP1 vs SL) =========
 async def result_resolver_loop(session):
-    # checks active_trades periodically and updates stats when TP/SL is hit
     while True:
         if not active_trades:
             await asyncio.sleep(5)
@@ -509,7 +502,6 @@ async def result_resolver_loop(session):
                 entry, sl, tp1 = tr["entry"], tr["sl"], tr["tp1"]
                 start_ms = tr["start_ms"]
 
-                # timeout?
                 if now_ms() - start_ms > WIN_TIMEOUT_MIN*60*1000:
                     if k in current_day_keys:
                         stats["losses"] += 1
@@ -522,78 +514,65 @@ async def result_resolver_loop(session):
                 bid = float(jt["bidPrice"]); ask = float(jt["askPrice"])
 
                 if direction == "Long":
-                    # win if bid >= tp1 first, loss if ask <= sl first
                     if bid >= tp1:
-                        if k in current_day_keys:
-                            stats["wins"] += 1
+                        if k in current_day_keys: stats["wins"] += 1
                         del active_trades[k]
                         await tg_send(session, format_result(sym, tr["tf"], direction, "WIN (TP1 hit)", entry, sl, tp1))
                     elif ask <= sl:
-                        if k in current_day_keys:
-                            stats["losses"] += 1
+                        if k in current_day_keys: stats["losses"] += 1
                         del active_trades[k]
                         await tg_send(session, format_result(sym, tr["tf"], direction, "LOSS (SL hit)", entry, sl, tp1))
                 else:
-                    # Short: win if ask <= tp1, loss if bid >= sl
                     if ask <= tp1:
-                        if k in current_day_keys:
-                            stats["wins"] += 1
+                        if k in current_day_keys: stats["wins"] += 1
                         del active_trades[k]
                         await tg_send(session, format_result(sym, tr["tf"], direction, "WIN (TP1 hit)", entry, sl, tp1))
                     elif bid >= sl:
-                        if k in current_day_keys:
-                            stats["losses"] += 1
+                        if k in current_day_keys: stats["losses"] += 1
                         del active_trades[k]
                         await tg_send(session, format_result(sym, tr["tf"], direction, "LOSS (SL hit)", entry, sl, tp1))
         await asyncio.gather(*(resolve_one(k) for k in keys))
         await asyncio.sleep(5)
 
-# ========= DAILY STATS PUSH AT 22:00 RIYADH =========
+# ========= DAILY STATS AT 22:00 RIYADH =========
+def format_stats_line():
+    total = stats["unique"]; wins = stats["wins"]; losses = stats["losses"]
+    wr = (wins / total * 100.0) if total > 0 else 0.0
+    return f"Unique Alerts: {total} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"
+
 async def daily_stats_loop(session):
     while True:
         sleep_s, target_dt = seconds_until_riyadh(STATS_DAILY_HOUR, 0)
         await asyncio.sleep(sleep_s)
-        # Compose period string: 22:00 yesterday -> 22:00 today
         today_2200 = target_dt
         yesterday_2200 = today_2200 - timedelta(days=1)
         period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} → {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
-
-        # Build & send daily digest
-        line = format_stats_line()
-        msg = f"[DAILY STATS]\nPeriod: {period_str}\n{line}"
+        msg = f"[DAILY STATS]\nPeriod: {period_str}\n{format_stats_line()}"
         await tg_send(session, msg)
-
-        # Reset for next day window
-        stats["unique"] = 0
-        stats["wins"] = 0
-        stats["losses"] = 0
+        stats["unique"] = 0; stats["wins"] = 0; stats["losses"] = 0
         current_day_keys.clear()
-        # Note: do NOT clear active_trades; if older trades resolve after the cutoff,
-        # they won't be counted in the new day's stats.
 
 # ========= WEB HEALTH =========
 async def health(_): return web.Response(text="ok")
 
+# ========= APP MAIN =========
 async def app_main():
     async with aiohttp.ClientSession() as session:
-        # Discover & warm
         symbols = await discover_top_usdt_perps(session, SCAN_LIMIT)
         print("Scanning symbols:", symbols)
         await warmup_klines(session, symbols)
         print("Warmup complete.")
 
-        # Background loops
         tasks = [
             asyncio.create_task(oi_loop(session, symbols)),
-            asyncio.create_task(macro_guard_loop(session)),
-            asyncio.create_task(scan_loop(session, symbols, "1m")),
-            asyncio.create_task(scan_loop(session, symbols, "5m")),
+            asyncio.create_task(macro_guard_loop(session)),       # BTC 1m macro shock
             asyncio.create_task(scan_loop(session, symbols, "15m")),
+            asyncio.create_task(scan_loop(session, symbols, "30m")),
+            asyncio.create_task(scan_loop(session, symbols, "1h")),
             asyncio.create_task(result_resolver_loop(session)),
-            asyncio.create_task(daily_stats_loop(session)),   # daily digest at 22:00 Riyadh
+            asyncio.create_task(daily_stats_loop(session)),       # daily digest 22:00 Riyadh
         ]
 
-        # Minimal web server for Railway health
         app = web.Application()
         app.router.add_get("/", health)
         runner = web.AppRunner(app); await runner.setup()

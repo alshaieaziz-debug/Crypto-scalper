@@ -1,0 +1,2 @@
+# Crypto-scalper
+Finds scalps

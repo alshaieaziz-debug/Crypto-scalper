@@ -8,7 +8,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Tunables
-SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "30"))     # change to 100 after first run
+SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))     # change to 100 after first run
 MIN_CONF = int(os.getenv("MIN_CONF", "8"))
 BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))     # 0.05% pad
 VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.25"))      # >=25% above 20-c avg
@@ -293,10 +293,78 @@ async def scan_loop(session, symbols, tf):
         async def process(sym):
             nonlocal alerts
             async with sem:
-                data = await bn_klines(session, sym, tf, limit=2)
+                data = await bn_klines(session, sym, tf, limit=3)
                 if not data or len(data)<2: return
                 last_closed = data[-1]
-                sig = detect_signal(sym, tf, last_closed)
+                sig = 
+
+def detect_signal(sym, tf, last_closed_row, prev_row=None):
+    # last closed candle
+    close_time = int(last_closed_row[6])
+    o = float(last_closed_row[1])
+    c = float(last_closed_row[4])
+    h = float(last_closed_row[2])
+    l = float(last_closed_row[3])
+    v = float(last_closed_row[5])
+
+    # previous candle (for engulfing)
+    po = pc = ph = pl = None
+    if prev_row:
+        po = float(prev_row[1]); pc = float(prev_row[4])
+        ph = float(prev_row[2]); pl = float(prev_row[3])
+
+    buf = kbuf[sym][tf]
+    if buf['last_close'] and close_time <= buf['last_close']:
+        return None
+    if len(buf['vol']) < 20:
+        return None
+
+    avg_vol = sum(buf['vol'])/len(buf['vol'])
+    vol_ok  = v >= avg_vol * VOL_SURGE_MIN
+
+    range_hi = max(buf['hi']) if buf['hi'] else None
+    range_lo = min(buf['lo']) if buf['lo'] else None
+    if range_hi is None or range_lo is None:
+        return None
+
+    pad = BREAKOUT_PAD_BPS/10000.0
+    long_break  = c > range_hi*(1+pad)
+    short_break = c < range_lo*(1-pad)
+
+    # ---- Engulfing after sweep (reversal) ----
+    bull_engulf = bear_engulf = False
+    if prev_row is not None:
+        # bodies
+        prev_bear = pc < po
+        prev_bull = pc > po
+        body_engulf_up   = (c > o) and prev_bear and (c >= po) and (o <= pc)
+        body_engulf_down = (c < o) and prev_bull and (c <= po) and (o >= pc)
+        # sweeps of the prior 10 bars (use buffers)
+        lo10 = min(list(buf['lo'])[-10:]) if len(buf['lo']) else None
+        hi10 = max(list(buf['hi'])[-10:]) if len(buf['hi']) else None
+        sweep_down = (lo10 is not None) and (l <= lo10)
+        sweep_up   = (hi10 is not None) and (h >= hi10)
+        bull_engulf = body_engulf_up and sweep_down
+        bear_engulf = body_engulf_down and sweep_up
+
+    # update buffers after evaluating
+    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
+    if len(buf['cl'])>21: buf['cl'].popleft()
+
+    if not vol_ok:
+        return None
+
+    if long_break or short_break:
+        direction = "Long" if long_break else "Short"
+        return {"direction":direction, "close":c, "open":o}
+
+    # Reversal path (if no breakout)
+    if bull_engulf:
+        return {"direction":"Long", "close":c, "open":o}
+    if bear_engulf:
+        return {"direction":"Short", "close":c, "open":o}
+
+    return None
                 if not sig: return
 
                 # --- Funding (must) ---

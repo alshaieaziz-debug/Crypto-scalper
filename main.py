@@ -82,7 +82,7 @@ kbuf = defaultdict(lambda: {
     '1h':  {'vol': deque(maxlen=64), 'hi': deque(maxlen=64), 'lo': deque(maxlen=64), 'cl': deque(maxlen=64), 'last_close': None},
 })
 oi_hist = defaultdict(lambda: deque(maxlen=120))  # per-minute OI samples
-oi_abs_ema = defaultdict(lambda: 0.0)             # EMA of abs 5m OIΔ for adaptive threshold
+oi_abs_ema = defaultdict(lambda: 0.0)             # EMA of abs 5m OIÎ for adaptive threshold
 last_alert_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
 macro_block_until = 0
 
@@ -91,8 +91,8 @@ BE_OVERRIDE_WINDOW_SEC = int(os.getenv("BE_OVERRIDE_WINDOW_SEC","600"))
 last_be_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
 be_override_used_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
 
-# Stats
-stats = {"unique": 0, "wins": 0, "losses": 0, "breakevens": 0}
+# Stats (UPDATED: include explicit counters for timeouts & early exits)
+stats = {"unique": 0, "wins": 0, "losses": 0, "breakevens": 0, "timeouts": 0, "early_exits": 0}
 dedup_seen = deque(maxlen=4000)
 active_trades = {}
 current_day_keys = set()
@@ -340,47 +340,65 @@ def rr_ok(entry, sl, tp1, min_r=1.0):
     return (reward / risk) >= min_r
 
 def leaderboard_line():
-    total = stats["unique"]; w = stats["wins"]; l = stats["losses"]; be = stats["breakevens"]
-    wr = (w/total*100.0) if total>0 else 0.0
-    return f"📊 *Today*: 🟢 {w}  🔴 {l}  ⚪️ {be}  |  WR: {wr:.1f}%  |  Alerts: {total}"
+    # UPDATED: include timeouts & early exits, WR computed on W/(W+L)
+    w = stats.get("wins",0); l = stats.get("losses",0); be = stats.get("breakevens",0)
+    to = stats.get("timeouts",0); ee = stats.get("early_exits",0)
+    total_msgs = w + l + be + to + ee
+    wr = (w / max(1, (w + l)) * 100.0)
+    return f"ð *Today*: ð¢ {w}  ð´ {l}  âªï¸ {be}  â³ {to}  ð {ee}  |  WR: {wr:.1f}%  |  Alerts: {total_msgs}"
 
 def format_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score, extras=None, override_note=None):
     ex = f"\n{extras}" if extras else ""
-    ov = f"\n🕒 Cooldown override: {override_note}" if override_note else ""
+    ov = f"\nð Cooldown override: {override_note}" if override_note else ""
     return (
-f"🔔 *TRADE ALERT*\n"
-f"• Pair: `{pair}`  • TF: *{tf}*\n"
-f"• Direction: *{direction}*\n"
-f"• Entry: `{entry:.6f}`\n"
-f"• SL: `{sl:.6f}`   • TP1 *(move SL→BE)*: `{tp1:.6f}`   • TP2 *(WIN)*: `{tp2:.6f}`\n"
-f"• Why: {reason}\n"
-f"• Score: *{score}/10*\n"
+f"ð *TRADE ALERT*\n"
+f"â¢ Pair: `{pair}`  â¢ TF: *{tf}*\n"
+f"â¢ Direction: *{direction}*\n"
+f"â¢ Entry: `{entry:.6f}`\n"
+f"â¢ SL: `{sl:.6f}`   â¢ TP1 *(move SLâBE)*: `{tp1:.6f}`   â¢ TP2 *(WIN)*: `{tp2:.6f}`\n"
+f"â¢ Why: {reason}\n"
+f"â¢ Score: *{score}/10*\n"
 f"{leaderboard_line()}{ex}{ov}"
 )
 
 def format_manage(pair, tf, direction, entry, tp2, new_sl):
     return (
-f"🛡️ *MANAGE*: Move SL → BE+{TP1_BE_OFFSET_R:.1f}R\n"
-f"• Pair: `{pair}`  • TF: *{tf}*  • Direction: *{direction}*\n"
-f"• New SL: `{new_sl:.6f}`\n"
-f"• Targeting TP2: `{tp2:.6f}`\n"
+f"ð¡ï¸ *MANAGE*: Move SL â BE+{TP1_BE_OFFSET_R:.1f}R\n"
+f"â¢ Pair: `{pair}`  â¢ TF: *{tf}*  â¢ Direction: *{direction}*\n"
+f"â¢ New SL: `{new_sl:.6f}`\n"
+f"â¢ Targeting TP2: `{tp2:.6f}`\n"
 f"{leaderboard_line()}"
 )
 
 def format_result(pair, tf, direction, result, entry, sl, tp1=None, tp2=None):
     extra = ""
-    if tp2 is not None: extra += f"  • TP2: `{tp2:.6f}`"
-    if tp1 is not None: extra = (f"  • TP1: `{tp1:.6f}`") + extra
-    emoji = "🟢" if "WIN" in result else ("🔴" if "LOSS" in result or "TIMEOUT" in result else "⚪️")
+    if tp2 is not None: extra += f"  â¢ TP2: `{tp2:.6f}`"
+    if tp1 is not None: extra = (f"  â¢ TP1: `{tp1:.6f}`") + extra
+
+    # UPDATED: neutral/semantic emojis (timeouts & early exits not red)
+    r = result.upper()
+    if "WIN" in r:
+        emoji = "ð¢"
+    elif "LOSS" in r:
+        emoji = "ð´"
+    elif "BREAKEVEN" in r:
+        emoji = "âªï¸"
+    elif "TIMEOUT" in r:
+        emoji = "â³"
+    elif "EARLY EXIT" in r:
+        emoji = "ð"
+    else:
+        emoji = "âªï¸"
+
     return (
-f"{emoji} *RESULT* — {result}\n"
-f"• Pair: `{pair}`  • TF: *{tf}*  • Direction: *{direction}*\n"
-f"• Entry: `{entry:.6f}`  • SL: `{sl:.6f}`{extra}\n"
+f"{emoji} *RESULT* â {result}\n"
+f"â¢ Pair: `{pair}`  â¢ TF: *{tf}*  â¢ Direction: *{direction}*\n"
+f"â¢ Entry: `{entry:.6f}`  â¢ SL: `{sl:.6f}`{extra}\n"
 f"{leaderboard_line()}"
 )
 
 def format_stats_line():
-    return f"📆 *Daily Stats*\n{leaderboard_line()}"
+    return f"ð *Daily Stats*\n{leaderboard_line()}"
 
 # ========= BINANCE WRAPPERS (weights tuned) =========
 async def bn_exchange_info(session): return await http_json(session, f"{BINANCE_BASE}/fapi/v1/exchangeInfo", weight_cost=10)
@@ -687,7 +705,7 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
     if buf['last_close'] and close_time <= buf['last_close']:
         return None
     if len(buf['vol']) < 20 or len(buf['hi']) < 20 or len(buf['lo']) < 20 or len(buf['cl']) < 20:
-        # not enough history — append and exit
+        # not enough history â append and exit
         buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
         return None
 
@@ -727,8 +745,8 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
         body_engulf_down = (c < o) and prev_bull and (c <= po) and (o >= pc)
         lo10 = min(lo_hist[-10:]) if lo_hist else None
         hi10 = max(hi_hist[-10:]) if hi_hist else None
-        sweep_down = (lo10 is not None) and (l <= lo10)
-        sweep_up   = (hi10 is not None) and (h >= hi10)
+        sweep_down = (l <= lo10) if lo10 is not None else False
+        sweep_up   = (h >= hi10) if hi10 is not None else False
         bull_engulf = body_engulf_up and sweep_down
         bear_engulf = body_engulf_down and sweep_up
 
@@ -786,7 +804,7 @@ async def scan_loop(session, symbols, tf):
                 if sig['direction']=="Long" and fr > FUNDING_MAX_ABS*1.2: return
                 if sig['direction']=="Short" and fr < -FUNDING_MAX_ABS*1.2: return
 
-                # OI alignment — queue then 5m hist (cached 60s)
+                # OI alignment â queue then 5m hist (cached 60s)
                 oi_pct = oi_5min_change_pct_from_queue(sym)
                 if oi_pct is None:
                     oi_pct = await bn_oi5m_change_pct(session, sym)
@@ -857,7 +875,7 @@ async def scan_loop(session, symbols, tf):
                     be_ts = last_be_at[sym][tf]
                     used_ts = be_override_used_at[sym][tf]
                     if be_ts and (now_s - be_ts <= BE_OVERRIDE_WINDOW_SEC) and (now_s - used_ts > BE_OVERRIDE_WINDOW_SEC):
-                        override_note = "last trade hit TP1→BE"
+                        override_note = "last trade hit TP1âBE"
                         be_override_used_at[sym][tf] = now_s
                     else:
                         return
@@ -874,13 +892,13 @@ async def scan_loop(session, symbols, tf):
 
                 score = 6
                 info_bits = [
-                    f"Vol≥{VOL_SURGE_MIN:.2f}x",
+                    f"Volâ¥{VOL_SURGE_MIN:.2f}x",
                     f"Funding {fr*100:.3f}%",
                     f"Spread {spread*100:.3f}% (max {max_spread_allowed*100:.3f}%)",
                     f"Depth1% ${depth_usd:,.0f} (min ${min_depth_required:,.0f})",
                 ]
                 if oi_pct is None: info_bits.append("OI missing")
-                else: info_bits.append(f"OIΔ5m {oi_pct*100:.2f}% (thr {adaptive_thr*100:.2f}%)")
+                else: info_bits.append(f"OIÎ5m {oi_pct*100:.2f}% (thr {adaptive_thr*100:.2f}%)")
                 if oi_soft_fail: score -= 1; info_bits.append("OI-price misalign")
                 else:            score += 1
                 if corr_soft:    score -= 1; info_bits.append(f"Corr soft: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
@@ -897,7 +915,7 @@ async def scan_loop(session, symbols, tf):
                 if HARD_BLOCK_SOFT_SESSION_BREAKOUT and sig["is_breakout"] and (sess_flag is True):
                     return
 
-                # Tape tilt — now optionally ALWAYS required
+                # Tape tilt â now optionally ALWAYS required
                 tape_score = 0
                 need_tape = TAPE_REQUIRE_ALWAYS or (score >= MIN_CONF-1 and score < MIN_CONF+2)
                 if need_tape:
@@ -954,7 +972,7 @@ async def scan_loop(session, symbols, tf):
                     }
                     alert_counts[tf] = alert_counts.get(tf, 0) + 1
 
-                reason_prefix = "🚀 Breakout + TRUE-ATR pad" if sig["is_breakout"] else "🔄 Engulfing reversal + sweep"
+                reason_prefix = "ð Breakout + TRUE-ATR pad" if sig["is_breakout"] else "ð Engulfing reversal + sweep"
                 extras = f"CLV:{clv_curr:.2f}  BreakQ:{break_quality:.2f}  BidDepth:${bid_usd:,.0f}  AskDepth:${ask_usd:,.0f}"
                 alert_text = format_alert(sym, sig['direction'], entry, sl, tp1, tp2,
                                  reason_prefix + "; " + ", ".join(info_bits), tf, final_score, extras, override_note)
@@ -979,8 +997,7 @@ async def result_resolver_loop(session):
                 tf = tr["tf"]
                 start_ms = tr["start_ms"]
 
-                # Early exit check (no progress)
-                # Update MFE in R
+                # Early exit check (no progress) + MFE update
                 R = tr.get("r", max(1e-9, abs(entry - sl)))
                 jt0 = await bn_book_ticker(session, sym)
                 if not jt0: return
@@ -992,16 +1009,17 @@ async def result_resolver_loop(session):
 
                 if now_ms() >= tr.get("early_check_ms", 0):
                     if tr["mfe_r"] < EARLY_EXIT_MIN_MFE_R:
-                        if k in current_day_keys: stats["losses"] += 1
+                        # UPDATED: count as early exit (not a loss)
+                        if k in current_day_keys: stats["early_exits"] += 1
                         del active_trades[k]
-                        await tg_send(session, format_result(sym, tf, direction, "EARLY EXIT (no progress)", entry, tr["sl"], tp1, tp2))
+                        await tg_send(session, format_result(sym, tf, direction, "EARLY EXIT (no progress â not counted)", entry, tr["sl"], tp1, tp2))
                         return
 
-                # Timeout
+                # Timeout (UPDATED: not a loss)
                 if now_ms() - start_ms > tf_timeout_minutes(tf)*60*1000:
-                    if k in current_day_keys: stats["losses"] += 1
+                    if k in current_day_keys: stats["timeouts"] += 1
                     del active_trades[k]
-                    await tg_send(session, format_result(sym, tf, direction, "TIMEOUT (counted as LOSS)", entry, tr["sl"], tp1, tp2))
+                    await tg_send(session, format_result(sym, tf, direction, "TIMEOUT (not counted)", entry, tr["sl"], tp1, tp2))
                     return
 
                 # Live check
@@ -1027,7 +1045,6 @@ async def result_resolver_loop(session):
                             del active_trades[k]
                             await tg_send(session, format_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
                         elif ask <= tr["sl"]:
-                            # Keep legacy label for compatibility
                             if k in current_day_keys: stats["breakevens"] += 1
                             del active_trades[k]
                             await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
@@ -1062,10 +1079,16 @@ async def daily_stats_loop(session):
         await asyncio.sleep(sleep_s)
         today_2200 = target_dt
         yesterday_2200 = today_2200 - timedelta(days=1)
-        period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} → {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
-        msg = f"🗓️ [DAILY STATS]\n{period_str}\n{format_stats_line()}"
+        period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} â {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
+        msg = f"ðï¸ [DAILY STATS]\n{period_str}\n{format_stats_line()}"
         await tg_send(session, msg)
-        stats["unique"] = 0; stats["wins"] = 0; stats["losses"] = 0; stats["breakevens"] = 0
+        # UPDATED: reset all counters, including timeouts & early_exits
+        stats["unique"] = 0
+        stats["wins"] = 0
+        stats["losses"] = 0
+        stats["breakevens"] = 0
+        stats["timeouts"] = 0
+        stats["early_exits"] = 0
         current_day_keys.clear()
         await persist_state()
 
@@ -1124,6 +1147,9 @@ def _hydrate_state(d):
     global stats, active_trades, dedup_seen, macro_block_until, symbol_meta, oi_abs_ema, last_symbols_persisted
     if not d: return
     stats.update(d.get("stats", {}))
+    # ensure new keys exist even if loading old state
+    stats.setdefault("timeouts", 0)
+    stats.setdefault("early_exits", 0)
     active_trades.clear(); active_trades.update(d.get("active_trades", {}))
     dedup_seen.clear(); dedup_seen.extend(d.get("dedup_seen", []))
     macro_block_until = d.get("macro_block_until", 0)

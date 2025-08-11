@@ -1,4 +1,3 @@
-
 # main.py
 import os, asyncio, time, json, random, math, signal
 from collections import deque, defaultdict
@@ -12,7 +11,13 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ========= TUNABLES =========
 SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "120"))
-MIN_CONF              = int(os.getenv("MIN_CONF", "7"))
+MIN_CONF              = int(os.getenv("MIN_CONF", "7"))  # fallback default
+# NEW (per-TF thresholds + direction penalty)
+MIN_CONF_15M          = int(os.getenv("MIN_CONF_15M", str(MIN_CONF)))
+MIN_CONF_30M          = int(os.getenv("MIN_CONF_30M", str(MIN_CONF)))
+MIN_CONF_1H           = int(os.getenv("MIN_CONF_1H",  str(MIN_CONF)))
+LONG_SIDE_PENALTY     = int(os.getenv("LONG_SIDE_PENALTY", "0"))
+
 BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))
 VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.30"))
 OI_DELTA_MIN_BASE     = float(os.getenv("OI_DELTA_MIN", "0.020"))
@@ -23,7 +28,11 @@ DEPTH_1PCT_MIN_USD    = float(os.getenv("DEPTH_1PCT_MIN_USD", "40000"))
 MACRO_BTC_SHOCK_BP    = float(os.getenv("MACRO_BTC_SHOCK_BP", "150"))
 MACRO_COOLDOWN_SEC    = int(os.getenv("MACRO_COOLDOWN_SEC", "900"))
 NEWS_PAUSE            = os.getenv("NEWS_PAUSE","false").lower() == "true"
-COINGLASS_API_KEY     = os.getenv("COINGLASS_API_KEY","")  # optional, not required now
+
+# NEW (hard block breakout in soft sessions)
+HARD_BLOCK_SOFT_SESSION_BREAKOUT = os.getenv("HARD_BLOCK_SOFT_SESSION_BREAKOUT","true").lower()=="true"
+
+COINGLASS_API_KEY     = os.getenv("COINGLASS_API_KEY","")  # optional
 
 HARD_REQUIRE_OI   = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
 CORR_HARD_BLOCK   = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
@@ -32,19 +41,28 @@ MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.008"))
 
 # Tape/CVD tilt
 TAPE_LOOKBACK_SEC = int(os.getenv("TAPE_LOOKBACK_SEC", "15"))
-TAPE_MIN_NOTIONAL = float(os.getenv("TAPE_MIN_NOTIONAL", "10000"))
+# NEW: always-on tape requirement (turn on)
+TAPE_REQUIRE_ALWAYS = os.getenv("TAPE_REQUIRE_ALWAYS","true").lower()=="true"
+TAPE_MIN_NOTIONAL = float(os.getenv("TAPE_MIN_NOTIONAL", "50000"))  # was 10k; now default 50k
 TAPE_TILT_STRONG  = float(os.getenv("TAPE_TILT_STRONG", "0.12"))
 TAPE_TILT_WEAK    = float(os.getenv("TAPE_TILT_WEAK", "0.05"))
 
 # Stats & reporting
 DEDUP_MIN            = int(os.getenv("DEDUP_MIN", "5"))
 STATS_DAILY_HOUR     = int(os.getenv("STATS_DAILY_HOUR", "22"))
+# NEW: shorter defaults via env (recommend: 120/180/300)
 WIN_TIMEOUT_15M_MIN  = int(os.getenv("WIN_TIMEOUT_15M_MIN", "240"))
 WIN_TIMEOUT_30M_MIN  = int(os.getenv("WIN_TIMEOUT_30M_MIN", "300"))
 WIN_TIMEOUT_1H_MIN   = int(os.getenv("WIN_TIMEOUT_1H_MIN", "480"))
+# NEW: early exit
+EARLY_EXIT_CHECK_FRAC = float(os.getenv("EARLY_EXIT_CHECK_FRAC","0.25"))  # at 25% of timeout
+EARLY_EXIT_MIN_MFE_R  = float(os.getenv("EARLY_EXIT_MIN_MFE_R","0.3"))    # must reach +0.3R by then
 
 # Breakout window
 BREAKOUT_LOOKBACK_BARS = int(os.getenv("BREAKOUT_LOOKBACK_BARS", "20"))
+
+# NEW: trailing after TP1 (BE + xR)
+TP1_BE_OFFSET_R = float(os.getenv("TP1_BE_OFFSET_R","0.2"))
 
 # Persistence
 STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")  # mount a persistent volume to /data on Railway
@@ -340,11 +358,11 @@ f"• Score: *{score}/10*\n"
 f"{leaderboard_line()}{ex}{ov}"
 )
 
-def format_manage(pair, tf, direction, entry, tp2):
+def format_manage(pair, tf, direction, entry, tp2, new_sl):
     return (
-f"🛡️ *MANAGE*: Move SL → BE\n"
+f"🛡️ *MANAGE*: Move SL → BE+{TP1_BE_OFFSET_R:.1f}R\n"
 f"• Pair: `{pair}`  • TF: *{tf}*  • Direction: *{direction}*\n"
-f"• New SL: `{entry:.6f}` (breakeven)\n"
+f"• New SL: `{new_sl:.6f}`\n"
 f"• Targeting TP2: `{tp2:.6f}`\n"
 f"{leaderboard_line()}"
 )
@@ -653,7 +671,7 @@ async def fetch_closed_kline(session, sym, tf):
             return prev2, last2
     return data[-3], data[-2]
 
-# ========= SIGNAL DETECTION =========
+# ========= SIGNAL DETECTION (FIXED: compute sweeps on history, append after) =========
 def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
     close_time = int(last_closed_row[6])
     o = float(last_closed_row[1]); c = float(last_closed_row[4])
@@ -669,26 +687,29 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
     if buf['last_close'] and close_time <= buf['last_close']:
         return None
     if len(buf['vol']) < 20 or len(buf['hi']) < 20 or len(buf['lo']) < 20 or len(buf['cl']) < 20:
+        # not enough history — append and exit
         buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
         return None
 
+    # Use history snapshots BEFORE appending this bar
     hi_hist = list(buf['hi'])
     lo_hist = list(buf['lo'])
+    cl_hist = list(buf['cl'])
+
     prev_range_hi = max(hi_hist[-BREAKOUT_LOOKBACK_BARS:]) if hi_hist else None
     prev_range_lo = min(lo_hist[-BREAKOUT_LOOKBACK_BARS:]) if lo_hist else None
 
     avg_vol = sum(buf['vol'])/len(buf['vol'])
     vol_ok  = v >= avg_vol * VOL_SURGE_MIN
-
-    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
-    for k in ("hi","lo","cl","vol"):
-        if len(buf[k])>64: buf[k].popleft()
-
-    if not vol_ok or prev_range_hi is None or prev_range_lo is None:
+    if (not vol_ok) or (prev_range_hi is None) or (prev_range_lo is None):
+        # append bar and exit
+        buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
+        for k in ("hi","lo","cl","vol"):
+            if len(buf[k])>64: buf[k].popleft()
         return None
 
-    highs = list(buf['hi']); lows = list(buf['lo']); closes = list(buf['cl'])
-    atr = true_atr(highs, lows, closes, period=14)
+    # ATR on history
+    atr = true_atr(hi_hist, lo_hist, cl_hist, period=14)
     if atr is not None:
         scale = {"15m":0.30, "30m":0.24, "1h":0.20}.get(tf, 0.24)
         pad_abs = atr * scale
@@ -704,8 +725,8 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
         prev_bull = pc > po
         body_engulf_up   = (c > o) and prev_bear and (c >= po) and (o <= pc)
         body_engulf_down = (c < o) and prev_bull and (c <= po) and (o >= pc)
-        lo10 = min(list(buf['lo'])[-10:]) if len(buf['lo']) else None
-        hi10 = max(list(buf['hi'])[-10:]) if len(buf['hi']) else None
+        lo10 = min(lo_hist[-10:]) if lo_hist else None
+        hi10 = max(hi_hist[-10:]) if hi_hist else None
         sweep_down = (lo10 is not None) and (l <= lo10)
         sweep_up   = (hi10 is not None) and (h >= hi10)
         bull_engulf = body_engulf_up and sweep_down
@@ -716,6 +737,11 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
         if is_inside:
             long_break = False
             short_break = False
+
+    # append current bar AFTER computing signals
+    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
+    for k in ("hi","lo","cl","vol"):
+        if len(buf[k])>64: buf[k].popleft()
 
     if long_break:
         return {"direction":"Long","close":c,"open":o,"prev_hi":prev_range_hi,"prev_lo":prev_range_lo,
@@ -867,28 +893,41 @@ async def scan_loop(session, symbols, tf):
                 if sig['direction']=="Short" and clv_curr <= 0.35: score += 1; info_bits.append("Strong close")
                 if break_quality >= 0.25: score += 1; info_bits.append("Clean break")
 
-                # Tape tilt — only compute if near threshold
+                # HARD BLOCK: breakout during soft session
+                if HARD_BLOCK_SOFT_SESSION_BREAKOUT and sig["is_breakout"] and (sess_flag is True):
+                    return
+
+                # Tape tilt — now optionally ALWAYS required
                 tape_score = 0
-                need_tape = (score >= MIN_CONF-1 and score < MIN_CONF+2)
+                need_tape = TAPE_REQUIRE_ALWAYS or (score >= MIN_CONF-1 and score < MIN_CONF+2)
                 if need_tape:
                     tilt, tnotional = await tape_tilt(session, sym)
                     tape_note = f"Tape tilt {tilt*100:.1f}% on ${tnotional:,.0f}"
-                    if tnotional >= TAPE_MIN_NOTIONAL:
-                        if sig['direction']=="Long":
-                            if tilt >= TAPE_TILT_STRONG: tape_score += 2
-                            elif tilt >= TAPE_TILT_WEAK: tape_score += 1
-                            elif tilt <= -TAPE_TILT_WEAK: tape_score -= 1
-                        else:
-                            if tilt <= -TAPE_TILT_STRONG: tape_score += 2
-                            elif tilt <= -TAPE_TILT_WEAK:  tape_score += 1
-                            elif tilt >=  TAPE_TILT_WEAK:  tape_score -= 1
+                    weak = TAPE_TILT_WEAK
+                    strong = TAPE_TILT_STRONG
+                    if TAPE_REQUIRE_ALWAYS:
+                        if tnotional < TAPE_MIN_NOTIONAL:
+                            return
+                        if sig['direction']=="Long" and tilt <  weak: return
+                        if sig['direction']=="Short" and tilt > -weak: return
+                    # scoring (still helpful)
+                    if sig['direction']=="Long":
+                        if tilt >= strong: tape_score += 2
+                        elif tilt >= weak: tape_score += 1
+                        elif tilt <= -weak: tape_score -= 1
                     else:
-                        tape_note += " (low flow)"
+                        if tilt <= -strong: tape_score += 2
+                        elif tilt <= -weak: tape_score += 1
+                        elif tilt >=  weak:  tape_score -= 1
                     info_bits.append(tape_note)
                     score += tape_score
 
                 final_score = max(1, min(10, score))
-                if final_score < MIN_CONF: return
+
+                # Per-TF MIN_CONF + long penalty
+                req_by_tf = {"15m": MIN_CONF_15M, "30m": MIN_CONF_30M, "1h": MIN_CONF_1H}
+                required = req_by_tf.get(tf, MIN_CONF) + (LONG_SIDE_PENALTY if sig["direction"]=="Long" else 0)
+                if final_score < required: return
 
                 # Dedup + stats
                 key = trade_key(sym, tf, sig['direction'], entry)
@@ -904,10 +943,14 @@ async def scan_loop(session, symbols, tf):
                     dedup_seen.append((key, nowm))
                     stats["unique"] += 1
                     current_day_keys.add(key)
+                    # store R + early-exit checkpoint
+                    R = abs(entry - sl)
+                    early_ms = nowm + int(EARLY_EXIT_CHECK_FRAC * tf_timeout_minutes(tf) * 60 * 1000)
                     active_trades[key] = {
                         "symbol": sym, "tf": tf, "direction": sig['direction'],
                         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-                        "start_ms": nowm, "be_moved": False
+                        "start_ms": nowm, "be_moved": False,
+                        "r": R, "mfe_r": 0.0, "early_check_ms": early_ms
                     }
                     alert_counts[tf] = alert_counts.get(tf, 0) + 1
 
@@ -920,7 +963,7 @@ async def scan_loop(session, symbols, tf):
         await asyncio.gather(*(process(s) for s in symbols))
         await tg_send_batched(session, alerts)
 
-# ========= RESULT RESOLVER =========
+# ========= RESULT RESOLVER (adds early exit + trailing after TP1) =========
 async def result_resolver_loop(session):
     while True:
         if not active_trades:
@@ -936,12 +979,32 @@ async def result_resolver_loop(session):
                 tf = tr["tf"]
                 start_ms = tr["start_ms"]
 
+                # Early exit check (no progress)
+                # Update MFE in R
+                R = tr.get("r", max(1e-9, abs(entry - sl)))
+                jt0 = await bn_book_ticker(session, sym)
+                if not jt0: return
+                bid0 = float(jt0["bidPrice"]); ask0 = float(jt0["askPrice"])
+                if direction == "Long":
+                    tr["mfe_r"] = max(tr.get("mfe_r",0.0), (bid0 - entry)/max(1e-9, R))
+                else:
+                    tr["mfe_r"] = max(tr.get("mfe_r",0.0), (entry - ask0)/max(1e-9, R))
+
+                if now_ms() >= tr.get("early_check_ms", 0):
+                    if tr["mfe_r"] < EARLY_EXIT_MIN_MFE_R:
+                        if k in current_day_keys: stats["losses"] += 1
+                        del active_trades[k]
+                        await tg_send(session, format_result(sym, tf, direction, "EARLY EXIT (no progress)", entry, tr["sl"], tp1, tp2))
+                        return
+
+                # Timeout
                 if now_ms() - start_ms > tf_timeout_minutes(tf)*60*1000:
                     if k in current_day_keys: stats["losses"] += 1
                     del active_trades[k]
-                    await tg_send(session, format_result(sym, tf, direction, "TIMEOUT (counted as LOSS)", entry, sl, tp1, tp2))
+                    await tg_send(session, format_result(sym, tf, direction, "TIMEOUT (counted as LOSS)", entry, tr["sl"], tp1, tp2))
                     return
 
+                # Live check
                 jt = await bn_book_ticker(session, sym)
                 if not jt: return
                 bid = float(jt["bidPrice"]); ask = float(jt["askPrice"])
@@ -949,41 +1012,46 @@ async def result_resolver_loop(session):
                 if direction == "Long":
                     if not tr["be_moved"]:
                         if bid >= tp1:
-                            tr["be_moved"] = True; tr["sl"] = entry
+                            # trail to BE + offset*R
+                            trail = entry + (TP1_BE_OFFSET_R * (entry - tr["sl"]))
+                            tr["be_moved"] = True; tr["sl"] = trail
                             last_be_at[sym][tf] = int(time.time())
-                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2))
-                        elif ask <= sl:
+                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2, trail))
+                        elif ask <= tr["sl"]:
                             if k in current_day_keys: stats["losses"] += 1
                             del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, sl, tp1, tp2))
+                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
                     else:
                         if bid >= tp2:
                             if k in current_day_keys: stats["wins"] += 1
                             del active_trades[k]
                             await tg_send(session, format_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
-                        elif ask <= entry:
+                        elif ask <= tr["sl"]:
+                            # Keep legacy label for compatibility
                             if k in current_day_keys: stats["breakevens"] += 1
                             del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, entry, tp1, tp2))
+                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
                 else:
                     if not tr["be_moved"]:
                         if ask <= tp1:
-                            tr["be_moved"] = True; tr["sl"] = entry
+                            # trail to BE + offset*R (short side)
+                            trail = entry - (TP1_BE_OFFSET_R * (tr["sl"] - entry))
+                            tr["be_moved"] = True; tr["sl"] = trail
                             last_be_at[sym][tf] = int(time.time())
-                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2))
-                        elif bid >= sl:
+                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2, trail))
+                        elif bid >= tr["sl"]:
                             if k in current_day_keys: stats["losses"] += 1
                             del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, sl, tp1, tp2))
+                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
                     else:
                         if ask <= tp2:
                             if k in current_day_keys: stats["wins"] += 1
                             del active_trades[k]
                             await tg_send(session, format_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
-                        elif bid >= entry:
+                        elif bid >= tr["sl"]:
                             if k in current_day_keys: stats["breakevens"] += 1
                             del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, entry, tp1, tp2))
+                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
         await asyncio.gather(*(resolve_one(k) for k in keys))
         await asyncio.sleep(3)
 

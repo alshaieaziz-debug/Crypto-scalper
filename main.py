@@ -1,11 +1,10 @@
-# main.py — MEXC-only scanner with header fix (X-MEXC-APIKEY + UA) to avoid 403
+# main.py — BINANCE-only scanner (USDT-M futures) with UA header
 # Python 3.10+
 #
 # Minimal .env (edit values)
 # TELEGRAM_BOT_TOKEN=your_bot_token
 # TELEGRAM_CHAT_ID=your_chat_id
-# MEXC_API_KEY=your_public_key   # used in header for public GETs to avoid 403
-# MEXC_API_SECRET=               # optional (not needed for GETs)
+# BINANCE_BASE=https://fapi.binance.com
 # SCAN_LIMIT=100
 # MIN_CONF=6
 # MIN_CONF_15M=6
@@ -30,6 +29,7 @@
 # MAX_CONCURRENT_TRADES=5
 # DEDUP_MIN=3
 # COOLDOWN_SEC=600
+# BE_OVERRIDE_WINDOW_SEC=180
 # WIN_TIMEOUT_15M_MIN=200
 # WIN_TIMEOUT_30M_MIN=240
 # WIN_TIMEOUT_1H_MIN=360
@@ -39,7 +39,7 @@
 # STATS_DAILY_HOUR=22
 # STATE_PATH=/data/state.json
 #
-import os, asyncio, time, json, random, math, signal, hmac, hashlib
+import os, asyncio, time, json, random, math, signal
 from collections import deque, defaultdict
 import aiohttp
 from aiohttp import web
@@ -79,6 +79,7 @@ MAX_CONCURRENT_TRADES = int(os.getenv("MAX_CONCURRENT_TRADES","5"))
 
 DEDUP_MIN   = int(os.getenv("DEDUP_MIN","3"))
 COOLDOWN_SEC= int(os.getenv("COOLDOWN_SEC","600"))
+BE_OVERRIDE_WINDOW_SEC = int(os.getenv("BE_OVERRIDE_WINDOW_SEC","180"))
 
 WIN_TIMEOUT_15M_MIN  = int(os.getenv("WIN_TIMEOUT_15M_MIN", "200"))
 WIN_TIMEOUT_30M_MIN  = int(os.getenv("WIN_TIMEOUT_30M_MIN", "240"))
@@ -91,10 +92,10 @@ STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_MAX_LEN = 3800
 
 # ========= CONSTANTS =========
-MEXC_BASE = os.getenv("MEXC_BASE", "https://contract.mexc.com")  # enforce HTTPS
+BINANCE_BASE = os.getenv("BINANCE_BASE", "https://fapi.binance.com")  # enforce HTTPS
 RIYADH_TZ = timezone(timedelta(hours=3))
 TIMEFRAMES = ["15m","30m","1h"]
-TF_TO_INTERVAL = {"15m":"Min15","30m":"Min30","1h":"Min60"}
+TF_TO_INTERVAL = {"15m":"15m","30m":"30m","1h":"1h"}
 TF_SECONDS = {"15m":900,"30m":1800,"1h":3600}
 
 # ========= STATE =========
@@ -116,10 +117,10 @@ current_day_keys = set()
 symbol_meta = {}
 
 cache_depth   = {}
-cache_ticker  = {}
+cache_book    = {}
 cache_contracts = None
 DEPTH_TTL = 1.0
-TICKER_TTL = 0.8
+BOOK_TTL = 0.8
 
 micro_hist = defaultdict(lambda: {"spread": deque(maxlen=240), "depth": deque(maxlen=240)})
 error_counters = defaultdict(int)
@@ -190,12 +191,11 @@ async def bucket_acquire(tokens=1):
         bucket_last_refill_ms = now
         bucket_tokens = max(0, bucket_tokens - tokens)
 
-# ========= DEFAULT HEADERS (403 fix) =========
+# ========= DEFAULT HEADERS =========
 DEFAULT_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "X-MEXC-APIKEY": os.getenv("MEXC_API_KEY", "")
 }
 
 # ========= HTTP HELPERS =========
@@ -224,7 +224,7 @@ async def http_request(session, method, url, params=None, headers=None, timeout=
                     except Exception:
                         pass
                     return None
-        except Exception:
+        except Exception as e:
             error_counters["exception"] += 1
             await asyncio.sleep((2**attempt) * base)
     return None
@@ -266,84 +266,80 @@ async def tg_send_batched(session, messages):
     if batch:
         await tg_send(session, batch)
 
-# ========= MEXC WRAPPERS =========
-async def mx_contracts(session):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/detail")
+# ========= BINANCE WRAPPERS =========
+async def bn_exchange_info(session):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/exchangeInfo", weight_cost=10)
 
-async def mx_kline(session, symbol, interval):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/kline/{symbol}",
-                           params={"interval": interval})
+async def bn_24h_tickers(session):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/ticker/24hr", weight_cost=40)
 
-async def mx_depth(session, symbol):
+async def bn_kline(session, symbol, interval):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/klines",
+                           params={"symbol": symbol, "interval": interval, "limit": 150}, weight_cost=2)
+
+async def bn_depth(session, symbol):
     ts = time.time()
     cached = cache_depth.get(symbol)
     if cached and ts - cached[0] <= DEPTH_TTL:
         return cached[1]
-    j = await http_json(session, f"{MEXC_BASE}/api/v1/contract/depth/{symbol}")
+    j = await http_json(session, f"{BINANCE_BASE}/fapi/v1/depth", params={"symbol": symbol, "limit": 50}, weight_cost=10)
     if j:
         cache_depth[symbol] = (ts, j)
     return j
 
-async def mx_deals(session, symbol, limit=100):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/deals/{symbol}",
-                           params={"limit": min(100, max(10, limit))})
+async def bn_trades(session, symbol, limit=100):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/trades", params={"symbol": symbol, "limit": min(100, max(10, limit))}, weight_cost=5)
 
-async def mx_funding_rate(session, symbol):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/funding_rate/{symbol}")
+async def bn_funding_rate(session, symbol):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/fundingRate", params={"symbol": symbol, "limit": 1}, weight_cost=1)
 
-async def mx_ticker(session, symbol):
+async def bn_book_ticker(session, symbol):
     ts = time.time()
-    cached = cache_ticker.get(symbol)
-    if cached and ts - cached[0] <= TICKER_TTL:
+    cached = cache_book.get(symbol)
+    if cached and ts - cached[0] <= BOOK_TTL:
         return cached[1]
-    j = await http_json(session, f"{MEXC_BASE}/api/v1/contract/ticker",
-                        params={"symbol": symbol})
+    j = await http_json(session, f"{BINANCE_BASE}/fapi/v1/ticker/bookTicker", params={"symbol": symbol}, weight_cost=2)
     if j:
-        cache_ticker[symbol] = (ts, j)
+        cache_book[symbol] = (ts, j)
     return j
+
+async def bn_open_interest(session, symbol):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/openInterest", params={"symbol": symbol}, weight_cost=1)
 
 # ========= DISCOVERY =========
 async def discover_top_usdt_perps(session, limit):
-    info = await mx_contracts(session)
-    if not info or not info.get("data"):
-        raise RuntimeError("Failed to load MEXC contracts")
+    info = await bn_exchange_info(session)
+    if not info or not info.get("symbols"):
+        raise RuntimeError("Failed to load Binance exchangeInfo")
     usdt = []
-    for c in info["data"]:
-        if c.get("quoteCoin")=="USDT" and c.get("settleCoin")=="USDT" and c.get("state")==0:
-            sym = c["symbol"]
+    for s in info["symbols"]:
+        if s.get("quoteAsset") == "USDT" and s.get("status") == "TRADING":
+            sym = s["symbol"]
             symbol_meta[sym] = {
-                "priceScale": c.get("priceScale", 4),
-                "amountScale": c.get("amountScale", 0),
-                "contractSize": float(c.get("contractSize", 1.0)),
-                "minVol": float(c.get("minVol", 1)),
-                "volUnit": float(c.get("volUnit", 1))
+                "priceScale": int(s.get("pricePrecision", 4)),
+                "amountScale": int(s.get("quantityPrecision", 0)),
             }
             usdt.append(sym)
-    sem = asyncio.Semaphore(10)
-    rank = []
-    async def one(sym):
-        async with sem:
-            j = await mx_ticker(session, sym)
-            if j and j.get("data"):
-                amt = float(j["data"].get("amount24", 0))
-                rank.append((amt, sym))
-    await asyncio.gather(*(one(s) for s in usdt))
-    ranked = [s for _, s in sorted(rank, key=lambda x: x[0], reverse=True)]
+    tickers = await bn_24h_tickers(session)
+    vol_map = {}
+    if isinstance(tickers, list):
+        for t in tickers:
+            try:
+                vol_map[t["symbol"]] = float(t.get("quoteVolume", 0.0))
+            except Exception:
+                pass
+    ranked = sorted(usdt, key=lambda sym: vol_map.get(sym, 0.0), reverse=True)
     return ranked[:limit]
 
 # ========= KLINE HELPERS =========
-def parse_kline_arrays(kjson):
-    if not kjson or not kjson.get("data"): return []
-    d = kjson["data"]
-    keys = ["time","open","close","high","low","vol"]
-    if not all(k in d for k in keys): return []
-    n = min(len(d["time"]), len(d["open"]), len(d["close"]), len(d["high"]), len(d["low"]), len(d["vol"]))
+def parse_kline_arrays_binance(kjson):
+    if not kjson or not isinstance(kjson, list): return []
     out = []
-    for i in range(n):
-        out.append({"t": int(d["time"][i]) * 1000,
-                    "o": float(d["open"][i]), "c": float(d["close"][i]),
-                    "h": float(d["high"][i]), "l": float(d["low"][i]),
-                    "v": float(d["vol"][i])})
+    for x in kjson:
+        # [Open time, Open, High, Low, Close, Volume, Close time, ...]
+        out.append({"t": int(x[0]),
+                    "o": float(x[1]), "h": float(x[2]), "l": float(x[3]), "c": float(x[4]),
+                    "v": float(x[5])})
     return out
 
 def next_close_ms(tf):
@@ -353,7 +349,7 @@ def next_close_ms(tf):
     if tf=="1h":   return (s - (s%3600) + 3600)*1000
 
 async def fetch_closed_bar(session, sym, tf):
-    arr = parse_kline_arrays(await mx_kline(session, sym, TF_TO_INTERVAL[tf]))
+    arr = parse_kline_arrays_binance(await bn_kline(session, sym, TF_TO_INTERVAL[tf]))
     if len(arr) < 3: return None, None
     tfms = TF_SECONDS[tf]*1000
     arr_sorted = sorted(arr, key=lambda x: x["t"])
@@ -418,8 +414,8 @@ def adaptive_micro_thresholds(sym):
     return max_spread, min_depth
 
 def depth_summarize(orderbook):
-    asks = orderbook.get("asks") or []
     bids = orderbook.get("bids") or []
+    asks = orderbook.get("asks") or []
     if not asks or not bids: return None
     best_ask = float(asks[0][0]); best_bid = float(bids[0][0])
     mid = (best_ask + best_bid)/2
@@ -431,7 +427,7 @@ def depth_summarize(orderbook):
     total = ask_usd + bid_usd
     return spread, bid_usd, ask_usd, total
 
-# ========= OI ADAPTIVE (holdVol) =========
+# ========= OI ADAPTIVE =========
 def _oi_5m_change_pct_from_queue(q):
     if len(q) < 5: return None
     newest_ts, newest_oi = q[-1]
@@ -457,34 +453,40 @@ def adaptive_oi_threshold(sym):
         return OI_DELTA_MIN_BASE
     return max(OI_DELTA_MIN_BASE, 0.75*ema)
 
-# ========= TAPE / CVD via deals =========
+# ========= TAPE / CVD via trades =========
 async def tape_tilt(session, sym):
-    j = await mx_deals(session, sym, limit=100)
-    if not j or not j.get("data"): return 0.0, 0.0
+    trades = await bn_trades(session, sym, limit=100)
+    if not trades: return 0.0, 0.0
+    book = await bn_book_ticker(session, sym)
+    bid = float(book.get("bidPrice", 0.0))
+    ask = float(book.get("askPrice", 0.0))
     nowt = now_ms()
     buy_n = 0.0; sell_n = 0.0
-    for t in j["data"]:
-        ts  = int(t.get("t", nowt))
+    for t in trades:
+        ts = int(t.get("time", nowt))
         if nowt - ts > TAPE_LOOKBACK_SEC*1000:
             continue
-        price = float(t["p"]); qty = float(t["v"])
+        price = float(t["price"]); qty = float(t["qty"])
         notional = price * qty
-        if int(t.get("T", 0)) == 1: buy_n += notional
-        elif int(t.get("T", 0)) == 2: sell_n += notional
+        # infer side: nearer to ask -> aggressive buy, nearer to bid -> aggressive sell
+        if abs(price - ask) < abs(price - bid):
+            buy_n += notional
+        else:
+            sell_n += notional
     total = buy_n + sell_n
     if total <= 0: return 0.0, 0.0
     return (buy_n - sell_n)/total, total
 
 # ========= ORDER-BOOK IMBALANCE SHIFT =========
 async def imbalance_shift(session, sym, direction):
-    ob1 = await mx_depth(session, sym)
+    ob1 = await bn_depth(session, sym)
     if not ob1: return 0.0
     s1 = depth_summarize(ob1)
     if not s1: return 0.0
     _, bid1, ask1, _ = s1
     share_bid1 = bid1 / max(1e-9, (bid1+ask1))
     await asyncio.sleep(max(0.2, min(2.0, IMB_SHIFT_WINDOW_SEC)))
-    ob2 = await mx_depth(session, sym)
+    ob2 = await bn_depth(session, sym)
     if not ob2: return 0.0
     s2 = depth_summarize(ob2)
     if not s2: return 0.0
@@ -502,17 +504,17 @@ async def imbalance_shift(session, sym, direction):
             eff = 1.0
     return eff
 
-# ========= OI LOOP =========
+# ========= OI LOOP (Binance open interest) =========
 async def oi_loop(session, symbols):
     while True:
         sem = asyncio.Semaphore(12)
         t0 = now_ms()
         async def one(sym):
             async with sem:
-                j = await mx_ticker(session, sym)
+                j = await bn_open_interest(session, sym)
                 try:
-                    if j and j.get("data") and "holdVol" in j["data"]:
-                        oi = float(j["data"]["holdVol"])
+                    if j and "openInterest" in j:
+                        oi = float(j["openInterest"])
                         oi_hist[sym].append((t0, oi))
                 except Exception:
                     pass
@@ -629,11 +631,11 @@ async def scan_loop(session, symbols, tf):
                 sig = detect_signal(sym, tf, last, prev, buf)
                 if not sig: return
 
-                fj = await mx_funding_rate(session, sym)
+                fj = await bn_funding_rate(session, sym)
                 fr = 0.0
                 try:
-                    if fj and fj.get("data") and "fundingRate" in fj["data"]:
-                        fr = float(fj["data"]["fundingRate"])
+                    if isinstance(fj, list) and fj:
+                        fr = float(fj[0].get("fundingRate", 0.0))
                 except Exception:
                     fr = 0.0
                 if sig['direction']=="Long" and fr > FUNDING_MAX_ABS*1.2: return
@@ -649,7 +651,7 @@ async def scan_loop(session, symbols, tf):
                 else:
                     if not (c<o and oi_pct <= -adaptive_thr): return
 
-                ob = await mx_depth(session, sym)
+                ob = await bn_depth(session, sym)
                 if not ob: return
                 ssum = depth_summarize(ob)
                 if not ssum: return
@@ -773,11 +775,10 @@ async def result_resolver_loop(session):
                 tf = tr["tf"]
                 start_ms = tr["start_ms"]
 
-                jt0 = await mx_ticker(session, sym)
-                if not jt0 or not jt0.get("data"): return
-                d0 = jt0["data"]
-                bid0 = float(d0.get("bid1", d0.get("lastPrice", entry)))
-                ask0 = float(d0.get("ask1", d0.get("lastPrice", entry)))
+                j0 = await bn_book_ticker(session, sym)
+                if not j0: return
+                bid0 = float(j0.get("bidPrice", entry))
+                ask0 = float(j0.get("askPrice", entry))
                 R = tr.get("r", max(1e-9, abs(entry - sl)))
                 if direction == "Long":
                     tr["mfe_r"] = max(tr.get("mfe_r",0.0), (bid0 - entry)/max(1e-9, R))
@@ -797,11 +798,10 @@ async def result_resolver_loop(session):
                     await tg_send(session, format_result_short(sym, tf, direction, "TIMEOUT", entry, sl, tp1, tp2))
                     return
 
-                jt = await mx_ticker(session, sym)
-                if not jt or not jt.get("data"): return
-                d = jt["data"]
-                bid = float(d.get("bid1", d.get("lastPrice", entry)))
-                ask = float(d.get("ask1", d.get("lastPrice", entry)))
+                j = await bn_book_ticker(session, sym)
+                if not j: return
+                bid = float(j.get("bidPrice", entry))
+                ask = float(j.get("askPrice", entry))
 
                 if direction == "Long":
                     if not tr["be_moved"]:
@@ -951,8 +951,8 @@ async def app_main():
         sem = asyncio.Semaphore(8)
         async def warm(sym, tf):
             async with sem:
-                kj = await mx_kline(session, sym, TF_TO_INTERVAL[tf])
-                arr = parse_kline_arrays(kj)
+                kj = await bn_kline(session, sym, TF_TO_INTERVAL[tf])
+                arr = parse_kline_arrays_binance(kj)
                 arr = sorted(arr, key=lambda x: x["t"])
                 for row in arr[-64:-1]:
                     buf = kbuf[sym][tf]

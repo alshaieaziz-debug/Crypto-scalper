@@ -1,1479 +1,711 @@
-# main.py (with dual data sources: Binance or MEXC for market data; MEXC execution adapter)
-# Data source toggle via env: DATA_SOURCE=binance | mexc
-# Defaults: Binance data + (optional) MEXC execution. Set DATA_SOURCE=mexc to use MEXC market data.
-#
-# Notes:
-# - Timeouts & early exits are NOT counted as losses in stats.
-# - Emoji/UTF-8 safe Telegram sender.
-# - Dead-symbol handling for Binance (-4108) retained; MEXC discovery avoids inactive pairs.
-# - Add simple drop_counters in /metrics to see why signals are filtered.
-#
-# © you. Use at your own risk.
-
 import os, asyncio, time, json, random, math, signal, hmac, hashlib
 from collections import deque, defaultdict
 import aiohttp
 from aiohttp import web
 from datetime import datetime, timezone, timedelta
 
-# ========= ENV CONFIG =========
-DATA_SOURCE           = os.getenv("DATA_SOURCE", "binance").lower()  # "binance" or "mexc"
+# ========= BASIC CONFIG (RELAXED DEFAULTS) =========
+RIYADH_TZ = timezone(timedelta(hours=3))
+TIMEFRAMES = ["15m","30m","1h"]
+PORT = int(os.getenv("PORT","8080"))
 
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
+# Alerts
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN","")
+TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID","")
 
-# Trading toggle (MEXC execution adapter)
+# Trading (MEXC futures)
 MEXC_LIVE          = os.getenv("MEXC_LIVE","false").lower()=="true"
 MEXC_API_KEY       = os.getenv("MEXC_API_KEY","")
 MEXC_API_SECRET    = os.getenv("MEXC_API_SECRET","")
-MEXC_OPEN_TYPE     = int(os.getenv("MEXC_OPEN_TYPE","1"))        # 1 iso, 2 cross
-MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE","2"))    # 2 one-way
+MEXC_OPEN_TYPE     = int(os.getenv("MEXC_OPEN_TYPE","1"))        # 1=Isolated, 2=Cross
+MEXC_POSITION_MODE = int(os.getenv("MEXC_POSITION_MODE","2"))    # 2=One-way
 MEXC_LEVERAGE      = int(os.getenv("MEXC_LEVERAGE","5"))
 MEXC_RISK_USDT     = float(os.getenv("MEXC_RISK_USDT","3"))
-MEXC_RECV_WINDOW   = os.getenv("MEXC_RECV_WINDOW","10000")       # ms
+MEXC_RECV_WINDOW   = os.getenv("MEXC_RECV_WINDOW","10000")
 
-# ========= TUNABLES =========
-SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "120"))
-MIN_CONF              = int(os.getenv("MIN_CONF", "7"))
-MIN_CONF_15M          = int(os.getenv("MIN_CONF_15M", str(MIN_CONF)))
-MIN_CONF_30M          = int(os.getenv("MIN_CONF_30M", str(MIN_CONF)))
-MIN_CONF_1H           = int(os.getenv("MIN_CONF_1H",  str(MIN_CONF)))
-LONG_SIDE_PENALTY     = int(os.getenv("LONG_SIDE_PENALTY", "0"))
+# Discovery / scanning
+SCAN_LIMIT         = int(os.getenv("SCAN_LIMIT","120"))
+STATS_DAILY_HOUR   = int(os.getenv("STATS_DAILY_HOUR","22"))
 
-BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))
-VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.30"))
-OI_DELTA_MIN_BASE     = float(os.getenv("OI_DELTA_MIN", "0.020"))
-FUNDING_MAX_ABS       = float(os.getenv("FUNDING_MAX_ABS", "0.0005"))
-SPREAD_MAX_ABS        = float(os.getenv("SPREAD_MAX_ABS", "0.0015"))
-DEPTH_1PCT_MIN_USD    = float(os.getenv("DEPTH_1PCT_MIN_USD", "40000"))
-MACRO_BTC_SHOCK_BP    = float(os.getenv("MACRO_BTC_SHOCK_BP", "150"))
-MACRO_COOLDOWN_SEC    = int(os.getenv("MACRO_COOLDOWN_SEC", "900"))
-NEWS_PAUSE            = os.getenv("NEWS_PAUSE","false").lower() == "true"
+# Core thresholds (relaxed)
+MIN_CONF_15M       = int(os.getenv("MIN_CONF_15M","3"))
+MIN_CONF_30M       = int(os.getenv("MIN_CONF_30M","3"))
+MIN_CONF_1H        = int(os.getenv("MIN_CONF_1H","3"))
+LONG_SIDE_PENALTY  = int(os.getenv("LONG_SIDE_PENALTY","0"))
+VOL_SURGE_MIN      = float(os.getenv("VOL_SURGE_MIN","1.10"))
+BREAKOUT_PAD_BPS   = float(os.getenv("BREAKOUT_PAD_BPS","5"))
+BREAKOUT_LOOKBACK_BARS = int(os.getenv("BREAKOUT_LOOKBACK_BARS","20"))
 
-HARD_BLOCK_SOFT_SESSION_BREAKOUT = os.getenv("HARD_BLOCK_SOFT_SESSION_BREAKOUT","true").lower()=="true"
-HARD_REQUIRE_OI   = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
-CORR_HARD_BLOCK   = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
-COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC","600"))
-MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.008"))
+# Tape / CVD (lenient)
+TAPE_REQUIRE_ALWAYS= os.getenv("TAPE_REQUIRE_ALWAYS","false").lower()=="true"
+TAPE_LOOKBACK_SEC  = int(os.getenv("TAPE_LOOKBACK_SEC","15"))
+TAPE_MIN_NOTIONAL  = float(os.getenv("TAPE_MIN_NOTIONAL","20000"))
+TAPE_TILT_WEAK     = float(os.getenv("TAPE_TILT_WEAK","0.03"))
+TAPE_TILT_STRONG   = float(os.getenv("TAPE_TILT_STRONG","0.08"))
 
-# Tape/CVD tilt
-TAPE_LOOKBACK_SEC = int(os.getenv("TAPE_LOOKBACK_SEC", "15"))
-TAPE_REQUIRE_ALWAYS = os.getenv("TAPE_REQUIRE_ALWAYS","true").lower()=="true"
-TAPE_MIN_NOTIONAL = float(os.getenv("TAPE_MIN_NOTIONAL", "50000"))
-TAPE_TILT_STRONG  = float(os.getenv("TAPE_TILT_STRONG", "0.12"))
-TAPE_TILT_WEAK    = float(os.getenv("TAPE_TILT_WEAK", "0.05"))
+# Market micro (lenient)
+SPREAD_MAX_ABS     = float(os.getenv("SPREAD_MAX_ABS","0.0020"))
+DEPTH_1PCT_MIN_USD = float(os.getenv("DEPTH_1PCT_MIN_USD","20000"))
 
-# Stats & reporting
-DEDUP_MIN            = int(os.getenv("DEDUP_MIN", "5"))
-STATS_DAILY_HOUR     = int(os.getenv("STATS_DAILY_HOUR", "22"))
-WIN_TIMEOUT_15M_MIN  = int(os.getenv("WIN_TIMEOUT_15M_MIN", "240"))
-WIN_TIMEOUT_30M_MIN  = int(os.getenv("WIN_TIMEOUT_30M_MIN", "300"))
-WIN_TIMEOUT_1H_MIN   = int(os.getenv("WIN_TIMEOUT_1H_MIN", "480"))
+# Funding (lenient)
+FUNDING_MAX_ABS    = float(os.getenv("FUNDING_MAX_ABS","0.0010"))
+
+# OI (soft)
+HARD_REQUIRE_OI    = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
+OI_DELTA_MIN_BASE  = float(os.getenv("OI_DELTA_MIN","0.01"))
+
+# Correlation & session (no hard blocks)
+CORR_HARD_BLOCK    = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
+HARD_BLOCK_SOFT_SESSION_BREAKOUT = os.getenv("HARD_BLOCK_SOFT_SESSION_BREAKOUT","false").lower()=="true"
+
+# Macro guard (easy)
+MACRO_BTC_SHOCK_BP = float(os.getenv("MACRO_BTC_SHOCK_BP","400"))
+MACRO_COOLDOWN_SEC = int(os.getenv("MACRO_COOLDOWN_SEC","300"))
+NEWS_PAUSE         = os.getenv("NEWS_PAUSE","false").lower()=="true"
+
+# Risk & lifecycle
+MAX_RISK_PCT       = float(os.getenv("MAX_RISK_PCT","0.012"))
+COOLDOWN_SEC       = int(os.getenv("COOLDOWN_SEC","300"))
+DEDUP_MIN          = int(os.getenv("DEDUP_MIN","5"))
+WIN_TIMEOUT_15M_MIN= int(os.getenv("WIN_TIMEOUT_15M_MIN","120"))
+WIN_TIMEOUT_30M_MIN= int(os.getenv("WIN_TIMEOUT_30M_MIN","180"))
+WIN_TIMEOUT_1H_MIN = int(os.getenv("WIN_TIMEOUT_1H_MIN","300"))
 EARLY_EXIT_CHECK_FRAC = float(os.getenv("EARLY_EXIT_CHECK_FRAC","0.25"))
 EARLY_EXIT_MIN_MFE_R  = float(os.getenv("EARLY_EXIT_MIN_MFE_R","0.3"))
 TP1_BE_OFFSET_R       = float(os.getenv("TP1_BE_OFFSET_R","0.2"))
 
-BREAKOUT_LOOKBACK_BARS = int(os.getenv("BREAKOUT_LOOKBACK_BARS", "20"))
-
-STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
-TELEGRAM_MAX_LEN = 3800
-
-# ========= CONSTANTS =========
-BINANCE_BASE = "https://fapi.binance.com"
-MEXC_BASE    = "https://contract.mexc.com"  # futures
-RIYADH_TZ = timezone(timedelta(hours=3))
-TIMEFRAMES = ["15m","30m","1h"]
-
 # ========= STATE =========
-kbuf = defaultdict(lambda: {
-    '15m': {'vol': deque(maxlen=64), 'hi': deque(maxlen=64), 'lo': deque(maxlen=64), 'cl': deque(maxlen=64), 'last_close': None},
-    '30m': {'vol': deque(maxlen=64), 'hi': deque(maxlen=64), 'lo': deque(maxlen=64), 'cl': deque(maxlen=64), 'last_close': None},
-    '1h':  {'vol': deque(maxlen=64), 'hi': deque(maxlen=64), 'lo': deque(maxlen=64), 'cl': deque(maxlen=64), 'last_close': None},
+MEXC_BASE="https://contract.mexc.com"
+kbuf=defaultdict(lambda:{
+    '15m':{'vol':deque(maxlen=64),'hi':deque(maxlen=64),'lo':deque(maxlen=64),'cl':deque(maxlen=64),'last_close':None},
+    '30m':{'vol':deque(maxlen=64),'hi':deque(maxlen=64),'lo':deque(maxlen=64),'cl':deque(maxlen=64),'last_close':None},
+    '1h': {'vol':deque(maxlen=64),'hi':deque(maxlen=64),'lo':deque(maxlen=64),'cl':deque(maxlen=64),'last_close':None},
 })
-oi_hist = defaultdict(lambda: deque(maxlen=120))  # per-minute OI (Binance: openInterest; MEXC: holdVol)
-oi_abs_ema = defaultdict(lambda: 0.0)
-last_alert_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
-macro_block_until = 0
+symbol_meta = {}  # sym -> {pricePrecision, qtyPrecision, contractSize}
+oi_hist     = defaultdict(lambda: deque(maxlen=120))
+oi_abs_ema  = defaultdict(float)
+last_alert_at=defaultdict(lambda:{'15m':0,'30m':0,'1h':0})
+last_be_at   =defaultdict(lambda:{'15m':0,'30m':0,'1h':0})
+be_override_used_at=defaultdict(lambda:{'15m':0,'30m':0,'1h':0})
+macro_block_until=0
+stats={"unique":0,"wins":0,"losses":0,"breakevens":0}
+dedup_seen=deque(maxlen=4000)
+active_trades={}
+current_day_keys=set()
+micro_hist=defaultdict(lambda:{"spread":deque(maxlen=240),"depth":deque(maxlen=240)})
+alert_counts={"15m":0,"30m":0,"1h":0}
+drop_counters=defaultdict(int)
+event_loop_lag_ms=0.0
 
-# BE override
-BE_OVERRIDE_WINDOW_SEC = int(os.getenv("BE_OVERRIDE_WINDOW_SEC","600"))
-last_be_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
-be_override_used_at = defaultdict(lambda: {'15m':0,'30m':0,'1h':0})
-
-# Stats
-stats = {"unique": 0, "wins": 0, "losses": 0, "breakevens": 0}
-dedup_seen = deque(maxlen=4000)
-active_trades = {}
-current_day_keys = set()
-
-# Symbol metadata
-# For Binance: {pricePrecision, qtyPrecision}
-# For MEXC:    {pricePrecision, qtyPrecision, contractSize, priceUnit}
-symbol_meta = {}  # key by internal symbol "BTCUSDT"
-
-# Caches
-cache_book    = {}  # sym -> (ts, json), TTL 3s
-cache_depth   = {}  # sym -> (ts, json), TTL 1.5s
-PREMIUM_TTL   = 3.0
-DEPTH_TTL     = 1.5
-DEPTH_LRU_MAX = 300
-
-# Per-symbol micro profiles
-micro_hist = defaultdict(lambda: {"spread": deque(maxlen=240), "depth": deque(maxlen=240)})
-alert_counts = {"15m": 0, "30m": 0, "1h": 0}
-
-# Metrics
-rate_used_weight_1m = 0
-rate_retry_after_ms = 0
-error_counters = defaultdict(int)
-event_loop_lag_ms = 0.0
-_last_heartbeat_monotonic = None
-
-# Token bucket (keep simple; protects Binance and still fine for MEXC)
-BUCKET_CAPACITY = 1200
-bucket_tokens = BUCKET_CAPACITY
-bucket_refill_rate_per_ms = BUCKET_CAPACITY / 60000.0
-bucket_last_refill_ms = 0
-bucket_lock = asyncio.Lock()
-
-# Persisted last symbols for startup fallback
-last_symbols_persisted = []
-
-# Correlation cache
-corr_cache = {"ts": 0.0, "btc": 0.0, "eth": 0.0, "ttl": 10.0}
-
-# OI cache fallback (Binance only) — kept for compatibility
-oi5m_cache = {}
-OI5M_TTL = 60.0
-
-# Dead symbols (Binance inactive -4108)
-dead_symbols = set()
-
-# Drop counters (why a candidate got filtered)
-drop_counters = defaultdict(int)
-
+# ========= UTILS =========
 def now_ms(): return int(time.time()*1000)
 def riyadh_now(): return datetime.now(RIYADH_TZ)
-
-def seconds_until_riyadh(hour=22, minute=0):
-    now = riyadh_now()
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if target <= now:
-        target += timedelta(days=1)
-    return (target - now).total_seconds(), target
-
-def tf_timeout_minutes(tf:str)->int:
-    if tf == "15m": return WIN_TIMEOUT_15M_MIN
-    if tf == "30m": return WIN_TIMEOUT_30M_MIN
-    return WIN_TIMEOUT_1H_MIN
-
-# ========= PRECISION HELPERS =========
-def _precision_from_step(step: str) -> int:
-    try:
-        s = step.rstrip('0')
-        if '.' in s:
-            return len(s.split('.')[1])
-        return 0
-    except Exception:
-        return 6
-
-def round_price(sym, px: float) -> float:
-    meta = symbol_meta.get(sym)
-    if not meta: return round(px, 6)
-    prec = meta.get("pricePrecision", 6)
-    factor = 10 ** prec
-    return math.floor(px * factor + 0.5) / factor
-
-def trade_key(sym, tf, direction, entry):
-    return f"{sym}|{tf}|{direction}|{round_price(sym, entry):.10f}"
-
-# ========= SMALL UTILS =========
-def percentile(arr, p):
-    if not arr: return None
-    a = sorted(arr)
-    k = (len(a)-1) * (p/100.0)
-    f = math.floor(k); c = math.ceil(k)
-    if f == c: return a[int(k)]
-    return a[f]*(c-k) + a[c]*(k-f)
-
-def sanitize_md(s: str) -> str:
-    return s.replace("_", "\\_")
-
+def seconds_until_riyadh(h, m):
+    n=riyadh_now(); t=n.replace(hour=h,minute=m,second=0,microsecond=0)
+    if t<=n: t+=timedelta(days=1); return (t-n).total_seconds(), t
+    return (t-n).total_seconds(), t
+def tf_timeout_minutes(tf): return WIN_TIMEOUT_15M_MIN if tf=="15m" else (WIN_TIMEOUT_30M_MIN if tf=="30m" else WIN_TIMEOUT_1H_MIN)
 def next_close_ms(tf):
-    s = int(time.time())
-    if tf=="1m":   return (s - (s%60)   + 60)*1000
-    if tf=="5m":   return (s - (s%300)  + 300)*1000
-    if tf=="15m":  return (s - (s%900)  + 900)*1000
-    if tf=="30m":  return (s - (s%1800) + 1800)*1000
-    if tf=="1h":   return (s - (s%3600) + 3600)*1000
+    s=int(time.time())
+    return (s - (s% (60 if tf=="1m" else (300 if tf=="5m" else (900 if tf=="15m" else (1800 if tf=="30m" else 3600))))) + (60 if tf=="1m" else (300 if tf=="5m" else (900 if tf=="15m" else (1800 if tf=="30m" else 3600)))))*1000
+def sanitize_md(s): return s.replace("_","\\_")
+def round_price(sym, px):
+    p=symbol_meta.get(sym,{}).get("pricePrecision",6); f=10**p; return math.floor(px*f+0.5)/f
+def trade_key(sym, tf, direction, entry): return f"{sym}|{tf}|{direction}|{round_price(sym,entry):.10f}"
+def percentile(arr,p):
+    if not arr: return None
+    a=sorted(arr); k=(len(a)-1)*(p/100.0); f=math.floor(k); c=math.ceil(k)
+    return a[int(k)] if f==c else a[f]*(c-k)+a[c]*(k-f)
 
-def tf_to_mexc_interval(tf: str) -> str:
-    return {"1m":"Min1","5m":"Min5","15m":"Min15","30m":"Min30","1h":"Min60"}.get(tf, "Min15")
+# ========= HTTP + TELEGRAM =========
+async def http_get(session, url, params=None, timeout=10):
+    try:
+        async with session.get(url, params=params, timeout=timeout) as r:
+            if r.status!=200: return None
+            try: return await r.json(content_type=None)
+            except: return json.loads(await r.text())
+    except: return None
 
-def interval_sec(tf: str) -> int:
-    return {"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600}.get(tf, 900)
+async def http_post(session, url, payload=None, headers=None, timeout=10):
+    try:
+        async with session.post(url, json=payload, headers=headers or {}, timeout=timeout) as r:
+            if r.status!=200: return None
+            try: return await r.json(content_type=None)
+            except: return json.loads(await r.text())
+    except: return None
 
-def to_mexc_symbol(sym: str) -> str:
-    # "BTCUSDT" -> "BTC_USDT"
-    if "_" in sym: return sym
-    if sym.endswith("USDT"):
-        return sym[:-4] + "_USDT"
-    return sym
-
-def from_mexc_symbol(s: str) -> str:
-    # "BTC_USDT" -> "BTCUSDT"
-    return s.replace("_","")
-
-# ========= TOKEN BUCKET =========
-async def bucket_acquire(tokens=1):
-    global bucket_tokens, bucket_last_refill_ms
-    async with bucket_lock:
-        now = now_ms()
-        if bucket_last_refill_ms == 0:
-            bucket_last_refill_ms = now
-        else:
-            elapsed = max(0, now - bucket_last_refill_ms)
-            bucket_tokens = min(BUCKET_CAPACITY, bucket_tokens + elapsed * bucket_refill_rate_per_ms)
-            bucket_last_refill_ms = now
-        if bucket_tokens >= tokens:
-            bucket_tokens -= tokens
-            return
-        needed = tokens - bucket_tokens
-        wait_ms = needed / bucket_refill_rate_per_ms
-        await asyncio.sleep(wait_ms/1000.0)
-        now = now_ms()
-        elapsed = max(0, now - bucket_last_refill_ms)
-        bucket_tokens = min(BUCKET_CAPACITY, bucket_tokens + elapsed * bucket_refill_rate_per_ms)
-        bucket_last_refill_ms = now
-        bucket_tokens = max(0, bucket_tokens - tokens)
-
-# ========= HTTP HELPERS =========
-async def http_request(session, method, url, params=None, headers=None, timeout=10, weight_cost=1, payload=None):
-    global rate_used_weight_1m, rate_retry_after_ms
-    await bucket_acquire(tokens=weight_cost)
-    base = 0.25
-    attempts = 6
-    for attempt in range(attempts):
-        try:
-            req = session.get if method == "GET" else session.post
-            async with req(url, params=params, headers=headers, timeout=timeout, json=payload) as r:
-                # Track Binance headers if present (harmless for MEXC)
-                try:
-                    if "X-MBX-USED-WEIGHT-1m" in r.headers:
-                        rate_used_weight_1m = int(r.headers["X-MBX-USED-WEIGHT-1m"])
-                    if "Retry-After" in r.headers:
-                        rate_retry_after_ms = int(float(r.headers["Retry-After"]) * 1000)
-                except Exception:
-                    pass
-
-                if r.status == 200:
-                    # Some MEXC endpoints reply with content-type text/plain; accept any
-                    try:
-                        return await r.json(content_type=None)
-                    except Exception:
-                        text = await r.text()
-                        try:
-                            return json.loads(text)
-                        except Exception:
-                            return {"raw": text}
-
-                error_counters[str(r.status)] += 1
-
-                if r.status in (418, 429):
-                    ra = r.headers.get("Retry-After")
-                    sleep_s = float(ra) if ra else 1.5*(2**attempt) * random.random()
-                    await asyncio.sleep(min(10.0, sleep_s))
-                elif 500 <= r.status < 600:
-                    sleep = (2**attempt) * base
-                    await asyncio.sleep(random.uniform(0, sleep))
-                else:
-                    try:
-                        txt = await r.text()
-                        print(f"HTTP {r.status} {url} params={params} resp={txt[:200]}")
-                    except Exception:
-                        pass
-                    return None
-        except Exception:
-            error_counters["exception"] += 1
-            sleep = (2**attempt) * base
-            await asyncio.sleep(random.uniform(0, sleep))
-    return None
-
-async def http_json(session, url, params=None, headers=None, timeout=10, weight_cost=1):
-    return await http_request(session, "GET", url, params=params, headers=headers, timeout=timeout, weight_cost=weight_cost)
-
-async def http_json_post(session, url, payload=None, timeout=8, weight_cost=1, headers=None):
-    return await http_request(session, "POST", url, payload=payload, timeout=timeout, weight_cost=weight_cost, headers=headers)
-
-# ========= TELEGRAM (UTF-8 safe) =========
 async def tg_send(session, text):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Telegram not configured.")
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID): return
+    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data={"chat_id":TELEGRAM_CHAT_ID,"text":text,"parse_mode":"Markdown"}
     try:
-        async with session.post(url, data=data, headers=headers, timeout=8) as r:
-            if r.status != 200:
-                body = await r.text()
-                print("Telegram send failed", r.status, body[:200])
-    except Exception as e:
-        print("Telegram send exception:", e)
+        async with session.post(url, data=json.dumps(data,ensure_ascii=False).encode("utf-8"),
+                                headers={"Content-Type":"application/json; charset=utf-8"}, timeout=8) as r:
+            if r.status!=200: print("TG send failed", r.status, await r.text())
+    except Exception as e: print("TG error", e)
 
-async def tg_send_batched(session, messages):
-    if not messages:
-        return
-    batch = ""
-    for msg in messages:
-        msg = sanitize_md(msg)
-        if len(batch) + len(msg) + 2 > TELEGRAM_MAX_LEN:
-            await tg_send(session, batch)
-            batch = msg
+async def tg_send_batched(session, msgs):
+    if not msgs: return
+    batch=""
+    for m in msgs:
+        m=sanitize_md(m)
+        if len(batch)+len(m)+2>3600:
+            await tg_send(session,batch); batch=m
         else:
-            if batch:
-                batch += "\n\n"
-            batch += msg
-    if batch:
-        await tg_send(session, batch)
+            batch = m if not batch else batch+"\n\n"+m
+    if batch: await tg_send(session,batch)
 
-# ========= BINANCE MARKET DATA =========
-async def bn_exchange_info(session): return await http_json(session, f"{BINANCE_BASE}/fapi/v1/exchangeInfo", weight_cost=10)
-async def bn_24h_all(session):       return await http_json(session, f"{BINANCE_BASE}/fapi/v1/ticker/24hr", weight_cost=40)
-async def bn_klines(session, symbol, interval, limit=2):
-    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/klines", params={"symbol":symbol,"interval":interval,"limit":limit}, weight_cost=1)
-async def bn_open_interest(session, symbol):
-    j = await http_json(session, f"{BINANCE_BASE}/fapi/v1/openInterest", params={"symbol":symbol}, weight_cost=1)
-    return j
-async def bn_premium_index(session, symbol, use_cache=True):
-    # funding & basis proxy
-    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/premiumIndex", params={"symbol":symbol}, weight_cost=1)
-async def bn_depth(session, symbol, limit=100):
-    ts = time.time()
-    cached = cache_depth.get(symbol)
-    if cached and ts - cached[0] <= DEPTH_TTL:
-        return cached[1]
-    j = await http_json(session, f"{BINANCE_BASE}/fapi/v1/depth", params={"symbol":symbol,"limit":limit}, weight_cost=5)
-    if j:
-        if len(cache_depth) >= DEPTH_LRU_MAX:
-            oldest = min(cache_depth.items(), key=lambda kv: kv[1][0])[0]
-            cache_depth.pop(oldest, None)
-        cache_depth[symbol] = (ts, j)
-    return j
-async def bn_book_ticker(session, symbol, use_cache=True):
-    ts = time.time()
-    if use_cache:
-        cached = cache_book.get(symbol)
-        if cached and ts - cached[0] <= 3.0:
-            return cached[1]
-    j = await http_json(session, f"{BINANCE_BASE}/fapi/v1/ticker/bookTicker", params={"symbol":symbol}, weight_cost=1)
-    if j: cache_book[symbol] = (ts, j)
-    return j
-async def bn_agg_trades(session, symbol, start_ms=None, end_ms=None, limit=1000):
-    params = {"symbol": symbol, "limit": min(1000, max(50, limit))}
-    if start_ms is not None: params["startTime"] = int(start_ms)
-    if end_ms is not None:   params["endTime"]   = int(end_ms)
-    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/aggTrades", params=params, weight_cost=1)
+# ========= MEXC API =========
+def to_mexc(sym): return sym if "_" in sym else (sym[:-4]+"_USDT" if sym.endswith("USDT") else sym)
+def from_mexc(s): return s.replace("_","")
+def tf_to_mexc(tf): return {"1m":"Min1","5m":"Min5","15m":"Min15","30m":"Min30","1h":"Min60"}[tf]
 
-# ========= MEXC MARKET DATA =========
-async def mx_contract_detail(session):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/detail", weight_cost=2)
-
-async def mx_kline(session, symbol_u, tf="15m", limit=64):
-    interval = tf_to_mexc_interval(tf)
-    j = await http_json(session, f"{MEXC_BASE}/api/v1/contract/kline/{symbol_u}", params={"interval": interval}, weight_cost=1)
-    if not j or not j.get("data"): return None
-    d = j.get("data", {})
-    times = d.get("time", []) or []
-    opens = d.get("open", []) or []
-    highs = d.get("high", []) or []
-    lows  = d.get("low", []) or []
-    closes= d.get("close", []) or []
-    vols  = d.get("vol", []) or []
-    out = []
-    sec = interval_sec(tf)
-    n = min(len(times), len(opens), len(highs), len(lows), len(closes), len(vols))
+async def mx_detail(session): return await http_get(session, f"{MEXC_BASE}/api/v1/contract/detail")
+async def mx_kline(session, sym_u, tf, limit=64):
+    j=await http_get(session, f"{MEXC_BASE}/api/v1/contract/kline/{sym_u}", params={"interval":tf_to_mexc(tf)})
+    if not j or "data" not in j: return None
+    d=j["data"]; ts=d.get("time",[]); o=d.get("open",[]); h=d.get("high",[]); l=d.get("low",[]); c=d.get("close",[]); v=d.get("vol",[])
+    sec={"1m":60,"5m":300,"15m":900,"30m":1800,"1h":3600}[tf]; out=[]
+    n=min(len(ts),len(o),len(h),len(l),len(c),len(v))
     for i in range(n):
-        ot = int(times[i]) * 1000
-        ct = ot + sec*1000  # close time (bar end)
-        o = float(opens[i]); h=float(highs[i]); l=float(lows[i]); c=float(closes[i]); v=float(vols[i])
-        out.append([ot, o, h, l, c, v, ct])
-    if limit and len(out) > limit:
-        out = out[-limit:]
-    return out
-
-async def mx_depth(session, symbol_u):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/depth/{symbol_u}", weight_cost=2)
-
-async def mx_ticker(session, symbol_u):
-    j = await http_json(session, f"{MEXC_BASE}/api/v1/contract/ticker", params={"symbol": symbol_u}, weight_cost=1)
-    try:
-        if isinstance(j, dict) and "data" in j:
-            return j["data"]
-    except Exception:
-        pass
-    return j
-
-async def mx_deals(session, symbol_u, limit=100):
-    return await http_json(session, f"{MEXC_BASE}/api/v1/contract/deals/{symbol_u}", params={"limit": min(100, max(50, limit))}, weight_cost=1)
-
-async def mx_funding_rate(session, symbol_u):
-    j = await http_json(session, f"{MEXC_BASE}/api/v1/contract/funding_rate/{symbol_u}", weight_cost=1)
-    if j and isinstance(j, dict):
-        d = j.get("data") or j
-        if isinstance(d, dict) and "fundingRate" in d:
-            return float(d["fundingRate"])
-    return None
-
-# ========= DATA SOURCE DISPATCH =========
-async def md_klines(session, symbol, tf, limit=64):
-    if DATA_SOURCE == "mexc":
-        return await mx_kline(session, to_mexc_symbol(symbol), tf, limit=limit)
-    return await bn_klines(session, symbol, tf, limit=limit)
-
-async def md_depth(session, symbol, limit=100):
-    if DATA_SOURCE == "mexc":
-        return await mx_depth(session, to_mexc_symbol(symbol))
-    return await bn_depth(session, symbol, limit=limit)
-
-async def md_book_ticker(session, symbol):
-    if DATA_SOURCE == "mexc":
-        d = await mx_ticker(session, to_mexc_symbol(symbol))
-        if not d: return None
-        return {"bidPrice": str(d.get("bid1", d.get("lastPrice"))), "askPrice": str(d.get("ask1", d.get("lastPrice")))}
-    return await bn_book_ticker(session, symbol)
-
-async def md_funding(session, symbol):
-    if DATA_SOURCE == "mexc":
-        fr = await mx_funding_rate(session, to_mexc_symbol(symbol))
-        if fr is None: return None
-        return {"lastFundingRate": str(fr)}
-    return await bn_premium_index(session, symbol)
-
-async def md_deals_tape(session, symbol, start_ms=None, end_ms=None, limit=100):
-    if DATA_SOURCE == "mexc":
-        return await mx_deals(session, to_mexc_symbol(symbol), limit=limit)
-    return await bn_agg_trades(session, symbol, start_ms, end_ms, limit=limit)
+        ot=int(ts[i])*1000; ct=ot+sec*1000
+        out.append([ot,float(o[i]),float(h[i]),float(l[i]),float(c[i]),float(v[i]),ct])
+    return out[-limit:] if limit and out else out
+async def mx_depth(session, sym_u): return await http_get(session, f"{MEXC_BASE}/api/v1/contract/depth/{sym_u}")
+async def mx_ticker(session, sym_u): 
+    j=await http_get(session, f"{MEXC_BASE}/api/v1/contract/ticker", params={"symbol":sym_u})
+    return j.get("data") if isinstance(j,dict) else j
+async def mx_deals(session, sym_u, limit=100): return await http_get(session, f"{MEXC_BASE}/api/v1/contract/deals/{sym_u}", params={"limit":min(100,max(50,limit))})
+async def mx_funding_rate(session, sym_u):
+    j=await http_get(session, f"{MEXC_BASE}/api/v1/contract/funding_rate/{sym_u}")
+    try: return float((j.get("data") or j).get("fundingRate"))
+    except: return None
 
 # ========= DISCOVERY =========
-async def discover_top_symbols_binance(session, limit):
-    info = await bn_exchange_info(session)
-    if not info:
-        if last_symbols_persisted:
-            print("exchangeInfo failed; falling back to persisted symbols list.")
-            return last_symbols_persisted[:limit]
-        raise RuntimeError("exchangeInfo failed and no persisted symbols")
-    for s in info.get('symbols', []):
-        if s.get('contractType')=='PERPETUAL' and s.get('quoteAsset')=='USDT' and s.get('status')=='TRADING':
-            sym = s['symbol']
-            pricePrec = s.get("pricePrecision"); qtyPrec = s.get("quantityPrecision")
-            if pricePrec is None: pricePrec = 4
-            if qtyPrec is None:   qtyPrec   = 0
-            symbol_meta[sym] = {"pricePrecision": int(pricePrec), "qtyPrecision": int(qtyPrec)}
-    tickers = await bn_24h_all(session)
-    perp_symbols = {s['symbol'] for s in info['symbols']
-                    if s.get('contractType')=='PERPETUAL' and s.get('quoteAsset')=='USDT' and s.get('status')=='TRADING'}
-    ranked = sorted([t for t in (tickers or []) if t['symbol'] in perp_symbols],
-                    key=lambda x: float(x.get('quoteVolume','0')), reverse=True)
-    syms = [t['symbol'] for t in ranked[:limit]]
-    return syms
-
-async def discover_top_symbols_mexc(session, limit):
-    det = await mx_contract_detail(session)
-    if not det or not det.get("data"):
-        if last_symbols_persisted:
-            print("MEXC detail failed; fallback to persisted symbols.")
-            return last_symbols_persisted[:limit]
-        raise RuntimeError("MEXC /contract/detail failed")
-    arr = det["data"]
-    metas = {}
-    base_list = []
-    for it in arr:
-        try:
-            if it.get("settleCoin") != "USDT": continue
-            if it.get("state", 0) != 0: continue
-            sym_u = it["symbol"]
-            sym = from_mexc_symbol(sym_u)
-            metas[sym] = {
-                "pricePrecision": int(it.get("priceScale", 4)),
-                "qtyPrecision":   int(it.get("volScale", 0)),
-                "contractSize":   float(it.get("contractSize", 1.0)),
-                "priceUnit":      float(it.get("priceUnit", 0.5))
-            }
-            base_list.append(sym)
-        except Exception:
-            continue
-    sem = asyncio.Semaphore(10)
-    vols = {}
-    async def one(sym):
-        nonlocal vols
-        sym_u = to_mexc_symbol(sym)
-        async with sem:
-            t = await mx_ticker(session, sym_u)
-            if t and isinstance(t, dict):
-                vols[sym] = float(t.get("amount24", 0.0))
-    await asyncio.gather(*(one(s) for s in base_list))
-    ranked = sorted(base_list, key=lambda s: vols.get(s, 0.0), reverse=True)[:limit]
-    for s, m in metas.items():
-        symbol_meta[s] = {
-            "pricePrecision": m["pricePrecision"],
-            "qtyPrecision":   m["qtyPrecision"],
-            "contractSize":   m["contractSize"],
-            "priceUnit":      m["priceUnit"]
-        }
+async def discover(session, limit):
+    det=await mx_detail(session); 
+    if not det or "data" not in det: raise RuntimeError("MEXC /detail failed")
+    metas={}; syms=[]
+    for it in det["data"]:
+        if it.get("settleCoin")!="USDT" or it.get("state")!=0: continue
+        sym_u=it["symbol"]; sym=from_mexc(sym_u)
+        metas[sym]={"pricePrecision":int(it.get("priceScale",4)),"qtyPrecision":int(it.get("volScale",0)),"contractSize":float(it.get("contractSize",1.0))}
+        syms.append(sym)
+    vols={}
+    async def one(s):
+        t=await mx_ticker(session, to_mexc(s))
+        if t: vols[s]=float(t.get("amount24",0.0))
+    await asyncio.gather(*(one(s) for s in syms))
+    ranked=sorted(syms, key=lambda s:vols.get(s,0.0), reverse=True)[:limit]
+    for s in ranked: symbol_meta[s]=metas[s]
     return ranked
 
-async def discover_top_usdt_perps(session, limit):
-    if DATA_SOURCE == "mexc":
-        return await discover_top_symbols_mexc(session, limit)
-    return await discover_top_symbols_binance(session, limit)
-
-async def warmup_klines(session, symbols):
-    sem = asyncio.Semaphore(8)
+async def warmup(session, symbols):
     async def load(sym, tf):
-        async with sem:
-            data = await md_klines(session, sym, tf, limit=64)
-            if not data or len(data)<21: return
-            for row in data[:-1]:
-                h,l,c,vol,ct = float(row[2]), float(row[3]), float(row[4]), float(row[5]), int(row[6])
-                buf = kbuf[sym][tf]
-                buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(vol); buf['cl'].append(c); buf['last_close']=ct
-    await asyncio.gather(*(load(s, tf) for s in symbols for tf in TIMEFRAMES))
+        data=await mx_kline(session, to_mexc(sym), tf, limit=64)
+        if not data or len(data)<21: return
+        for row in data[:-1]:
+            h,l,c,vol,ct=float(row[2]),float(row[3]),float(row[4]),float(row[5]),int(row[6])
+            b=kbuf[sym][tf]; b['hi'].append(h); b['lo'].append(l); b['vol'].append(vol); b['cl'].append(c); b['last_close']=ct
+    await asyncio.gather(*(load(s,tf) for s in symbols for tf in TIMEFRAMES))
 
-# ========= OI LOOPS & HELPERS =========
-async def bn_oi5m_change_pct(session, symbol):
-    url = f"{BINANCE_BASE}/futures/data/openInterestHist"
-    params = {"symbol": symbol, "period": "5m", "limit": 2}
-    j = await http_json(session, url, params=params, weight_cost=1)
-    pct = None
-    try:
-        if j and isinstance(j, list) and len(j) >= 2:
-            old = float(j[-2]["sumOpenInterest"])
-            new = float(j[-1]["sumOpenInterest"])
-            if old > 0:
-                pct = (new - old) / old
-    except Exception:
-        pct = None
-    return pct
-
+# ========= OI / CORR / SESSION =========
 async def oi_loop(session, symbols):
     while True:
-        t0 = now_ms()
-        sem = asyncio.Semaphore(12)
-
+        t0=now_ms()
         async def one(sym):
-            if DATA_SOURCE == "mexc":
-                d = await mx_ticker(session, to_mexc_symbol(sym))
-                if d and "holdVol" in d:
-                    try:
-                        oi = float(d["holdVol"])
-                        oi_hist[sym].append((t0, oi))
-                    except Exception:
-                        pass
-                return
-            j = await bn_open_interest(session, sym)
-            if j and 'openInterest' in j:
-                oi_hist[sym].append((t0, float(j['openInterest'])))
-            elif j and isinstance(j, dict) and j.get("code") == -4108:
-                dead_symbols.add(sym)
+            d=await mx_ticker(session, to_mexc(sym))
+            if d and "holdVol" in d:
+                try: oi_hist[sym].append((t0,float(d["holdVol"])))
+                except: pass
+        await asyncio.gather(*(one(s) for s in symbols))
+        await asyncio.sleep(60 - (time.time()%60) + 0.05)
 
-        await asyncio.gather(*(one(s) for s in symbols if s not in dead_symbols))
-        await asyncio.sleep(60 - (time.time()%60) + 0.02)
-
-def _oi_5m_change_pct_from_queue(q, idx_latest=None):
-    if len(q) < 5: return None
-    if idx_latest is None: newest_ts, newest_oi = q[-1]
-    else:                  newest_ts, newest_oi = q[idx_latest]
-    target = newest_ts - 5*60*1000 - 5000
-    older = None
-    r = range(len(q)-1, -1, -1) if idx_latest is None else range(idx_latest, -1, -1)
-    for i in r:
-        ts, val = q[i]
-        if ts <= target:
-            older = (ts, val); break
-    if not older: old_ts, old_oi = q[0]
-    else:         old_ts, old_oi = older
-    if old_oi == 0: return None
-    return (newest_oi - old_oi) / old_oi
-
-def oi_5min_change_pct_from_queue(sym):
-    q = oi_hist[sym]
-    return _oi_5m_change_pct_from_queue(q)
+def _oi_5m_from_queue(q):
+    if len(q)<5: return None
+    newest_ts,newest=q[-1]; target=newest_ts-5*60*1000-5000
+    older=None
+    for i in range(len(q)-1,-1,-1):
+        ts,val=q[i]
+        if ts<=target: older=(ts,val); break
+    old=q[0][1] if not older else older[1]
+    return None if old==0 else (newest-old)/old
 
 def adaptive_oi_threshold(sym):
-    q = oi_hist[sym]
-    newest = _oi_5m_change_pct_from_queue(q)
-    if newest is not None:
-        a = 0.25
-        oi_abs_ema[sym] = a*abs(newest) + (1-a)*oi_abs_ema[sym]
-    ema = oi_abs_ema[sym]
-    if ema == 0.0 and len(q) < 11:
-        return OI_DELTA_MIN_BASE
-    return max(OI_DELTA_MIN_BASE, 0.75*ema)
+    q=oi_hist[sym]; newest=_oi_5m_from_queue(q)
+    if newest is not None: oi_abs_ema[sym]=0.25*abs(newest)+0.75*oi_abs_ema[sym]
+    ema=oi_abs_ema[sym]
+    return max(OI_DELTA_MIN_BASE, 0.75*ema) if not (ema==0 and len(q)<11) else OI_DELTA_MIN_BASE
+
+async def correlation_soft_flag(session, direction):
+    async def ret5m(sym):
+        d=await mx_kline(session, to_mexc(sym), "5m", limit=2)
+        if not d or len(d)<2: return 0.0
+        p,l=d[-2],d[-1]; return (float(l[4])-float(p[4]))/max(1e-12,float(p[4]))
+    btc,eth=await asyncio.gather(ret5m("BTCUSDT"), ret5m("ETHUSDT"))
+    soft = (direction=="Long" and (btc<-0.005 or eth<-0.005)) or (direction=="Short" and (btc>0.005 or eth>0.005))
+    return soft, btc, eth
+
+def session_soft_flag(tf, closes):
+    if len(closes)<30: return None
+    rets=[abs((closes[i]-closes[i-1])/max(1e-12,closes[i-1])) for i in range(1,len(closes))]
+    atrp=sum(rets[-20:])/20.0; th={"15m":0.0060,"30m":0.0090,"1h":0.0130}[tf]
+    return atrp < th
 
 # ========= MACRO GUARD =========
 async def macro_guard_loop(session):
     global macro_block_until
-    sym, tf = "BTCUSDT", "1m"
     while True:
-        data = await md_klines(session, sym, tf, limit=21)
-        if data and len(data)>=21:
-            prev20 = data[-21:-1]
-            last   = data[-1]
-            avg_vol = sum(float(r[5]) for r in prev20)/20.0
-            last_vol = float(last[5])
-            o, c = float(last[1]), float(last[4])
-            move_bp = abs((c - o)/max(1e-12,o))*10000
-            vol_surge = last_vol >= avg_vol*1.5
-            if move_bp >= MACRO_BTC_SHOCK_BP and vol_surge:
-                macro_block_until = now_ms() + MACRO_COOLDOWN_SEC*1000
+        d=await mx_kline(session, to_mexc("BTCUSDT"), "1m", limit=21)
+        if d and len(d)>=21:
+            prev20=d[-21:-1]; last=d[-1]
+            avg_vol=sum(float(r[5]) for r in prev20)/20.0
+            last_vol=float(last[5]); o=float(last[1]); c=float(last[4])
+            move_bp=abs((c-o)/max(1e-12,o))*10000
+            if move_bp>=MACRO_BTC_SHOCK_BP and last_vol>=avg_vol*1.5:
+                macro_block_until=now_ms()+MACRO_COOLDOWN_SEC*1000
         await asyncio.sleep(60)
 
-def macro_ok():
-    return (not NEWS_PAUSE) and now_ms() >= macro_block_until
+def macro_ok(): return (not NEWS_PAUSE) and now_ms()>=macro_block_until
 
-# ========= CORRELATION (cache 10s) =========
-async def correlation_soft_flag(session, direction):
-    nowt = time.time()
-    if nowt - corr_cache["ts"] <= corr_cache["ttl"]:
-        btc, eth = corr_cache["btc"], corr_cache["eth"]
-    else:
-        async def ret5m(sym):
-            data = await md_klines(session, sym, "5m", limit=2)
-            if not data or len(data)<2: return 0.0
-            prev, last = data[-2], data[-1]
-            return (float(last[4]) - float(prev[4]))/max(1e-12,float(prev[4]))
-        btc, eth = await asyncio.gather(ret5m("BTCUSDT"), ret5m("ETHUSDT"))
-        corr_cache["ts"] = nowt; corr_cache["btc"] = btc; corr_cache["eth"] = eth
-    soft = False
-    if direction=="Long" and (btc < -0.005 or eth < -0.005): soft = True
-    if direction=="Short" and (btc >  0.005 or eth >  0.005): soft = True
-    return soft, btc, eth
-
-# ========= SESSION VOL =========
-def session_soft_flag(tf, closes):
-    if len(closes) < 30:
-        return None
-    rets = [abs((closes[i]-closes[i-1])/max(1e-12, closes[i-1])) for i in range(1,len(closes))]
-    atrp = sum(rets[-20:])/20.0
-    th = {"15m":0.0060, "30m":0.0090, "1h":0.0130}.get(tf, 0.009)
-    return atrp < th
-
-# ========= MICROSTRUCTURE PROFILING =========
-def update_micro_profile(sym, spread, depth_usd):
-    micro_hist[sym]["spread"].append(max(1e-12, spread))
-    micro_hist[sym]["depth"].append(max(0.0, depth_usd))
-
-def adaptive_micro_thresholds(sym):
-    s_hist = list(micro_hist[sym]["spread"])
-    d_hist = list(micro_hist[sym]["depth"])
-    if len(s_hist) < 25 or len(d_hist) < 25:
-        return SPREAD_MAX_ABS, DEPTH_1PCT_MIN_USD
-    p60_spread = percentile(s_hist, 60) or SPREAD_MAX_ABS
-    p40_depth  = percentile(d_hist, 40) or DEPTH_1PCT_MIN_USD
-    max_spread = min(max(SPREAD_MAX_ABS, p60_spread * 1.2), SPREAD_MAX_ABS * 2.0)
-    min_depth  = max(min(DEPTH_1PCT_MIN_USD, p40_depth * 0.9), DEPTH_1PCT_MIN_USD * 0.6)
-    return max_spread, min_depth
-
-def depth_checks_side(orderbook, direction, max_spread_allowed, min_depth_required, contract_size=1.0):
-    try:
-        # MEXC depth: [price, qty, count]; Binance depth: [price, qty]
-        a0 = orderbook['asks'][0]; b0 = orderbook['bids'][0]
-        best_ask = float(a0[0]); best_bid = float(b0[0])
-        spread = (best_ask - best_bid) / max(1e-12, ((best_ask + best_bid)/2))
-        if spread > max_spread_allowed:
-            return False, spread, 0.0, 0.0, 0.0
-        up_lim  = best_ask * 1.01
-        dn_lim  = best_bid * 0.99
-        def sum_usd(side, cond):
-            s = 0.0
-            for row in side:
-                p = float(row[0]); q = float(row[1])
-                if cond(p): s += p * (q * contract_size)
-            return s
-        ask_usd = sum_usd(orderbook['asks'], lambda p: p<=up_lim)
-        bid_usd = sum_usd(orderbook['bids'], lambda p: p>=dn_lim)
-        total = ask_usd + bid_usd
-        if total < min_depth_required:
-            return False, spread, bid_usd, ask_usd, total
-        if direction == "Long":
-            if bid_usd < min_depth_required * 0.45: return False, spread, bid_usd, ask_usd, total
-            imb = bid_usd / max(1e-9, total)
-            if imb < 0.52: return False, spread, bid_usd, ask_usd, total
-        else:
-            if ask_usd < min_depth_required * 0.45: return False, spread, bid_usd, ask_usd, total
-            imb = ask_usd / max(1e-9, total)
-            if imb < 0.52: return False, spread, bid_usd, ask_usd, total
-        return True, spread, bid_usd, ask_usd, total
-    except Exception:
-        return False, 1.0, 0.0, 0.0, 0.0
-
-# ========= TAPE / CVD =========
-async def tape_tilt(session, sym):
-    end_ms = now_ms()
-    start_ms = end_ms - TAPE_LOOKBACK_SEC*1000
-    j = await md_deals_tape(session, sym, start_ms, end_ms, limit=100)
-    if not j: return 0.0, 0.0
-    data = j.get("data") if isinstance(j, dict) else j
-    if not data: return 0.0, 0.0
-    buy_n = 0.0; sell_n = 0.0
-    # Binance aggTrades has maker flag; MEXC deals: T 1=buy 2=sell
-    for t in data:
-        try:
-            price = float(t.get("p", t.get("price", 0.0)))
-            qty   = float(t.get("v", t.get("qty", 0.0)))
-            typ   = int(t.get("T", t.get("type", 0)))  # 1 buy, 2 sell
-        except Exception:
-            continue
-        # notional USD; for MEXC qty is contracts, multiply by contractSize if available
-        cs = symbol_meta.get(sym,{}).get("contractSize", 1.0)
-        notional = price * (qty * cs)
-        if notional <= 0: continue
-        if DATA_SOURCE == "mexc":
-            if typ == 1: buy_n += notional
-            elif typ == 2: sell_n += notional
-        else:
-            # binance branch (no typ): emulate using maker flag mapping if present
-            is_maker_sell = t.get("m") is True
-            if is_maker_sell: sell_n += notional
-            else:             buy_n  += notional
-    total = buy_n + sell_n
-    if total <= 0: return 0.0, 0.0
-    return (buy_n - sell_n)/total, total
-
-# ========= KLINE CLOSE VALIDATION =========
-async def fetch_closed_kline(session, sym, tf):
-    data = await md_klines(session, sym, tf, limit=3)
-    if not data or len(data)<3: return None, None
-    prev = data[-2]; last = data[-1]
-    if int(last[6]) <= now_ms() - 1000:
-        return prev, last
-    await asyncio.sleep(1.0)
-    data2 = await md_klines(session, sym, tf, limit=3)
-    if data2 and len(data2)>=3:
-        prev2, last2 = data2[-2], data2[-1]
-        if int(last2[6]) <= now_ms() - 1000:
-            return prev2, last2
-    return data[-3], data[-2]
-
-# ========= LEVELS / ATR =========
-def tf_swing_window(tf:str)->int:
-    return {"15m":5, "30m":3, "1h":2}.get(tf, 3)
-
-def pick_swing_levels(tf, highs, lows, closes):
-    n = tf_swing_window(tf)
-    hi_list = list(highs)[-max(5, n*2):]
-    lo_list = list(lows)[-max(5, n*2):]
-
-    filt_hi, filt_lo = [], []
-    for i in range(1, len(hi_list)):
-        if hi_list[i] <= hi_list[i-1] and lo_list[i] >= lo_list[i-1]:
-            continue  # inside bar
-        filt_hi.append(hi_list[i]); filt_lo.append(lo_list[i])
-    if not filt_hi or not filt_lo:
-        filt_hi, filt_lo = hi_list, lo_list
-
-    sl_long = min(filt_lo[-n:]) if len(filt_lo) >= n else (min(filt_lo) if filt_lo else None)
-    sl_short= max(filt_hi[-n:]) if len(filt_hi) >= n else (max(filt_hi) if filt_hi else None)
-    return sl_long, sl_short
-
-def true_atr(highs, lows, closes, period=14):
-    n = min(len(highs), len(lows), len(closes))
-    if n < period + 1: return None
-    trs = []
-    for i in range(n - period, n):
-        if i-1 < 0: return None
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i-1]),
-            abs(lows[i]  - closes[i-1])
-        )
-        trs.append(tr)
-    if not trs: return None
-    return sum(trs)/len(trs)
+# ========= SIGNALS =========
+def tf_swing_window(tf): return {"15m":5,"30m":3,"1h":2}[tf]
+def true_atr(h,l,c,period=14):
+    n=min(len(h),len(l),len(c))
+    if n<period+1: return None
+    trs=[max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(n-period,n)]
+    return sum(trs)/len(trs) if trs else None
 
 def rr_ok(entry, sl, tp1, min_r=1.0):
     if sl is None: return False
-    risk = abs(entry - sl)
-    if risk <= 0: return False
-    reward = (tp1 - entry) if tp1 > entry else (entry - tp1)
-    return (reward / risk) >= min_r
+    risk=abs(entry-sl); 
+    if risk<=0: return False
+    reward=(tp1-entry) if tp1>entry else (entry-tp1)
+    return (reward/risk)>=min_r
 
-def leaderboard_line():
-    total = stats["unique"]; w = stats["wins"]; l = stats["losses"]; be = stats["breakevens"]
-    wr = (w/total*100.0) if total>0 else 0.0
-    return f"📊 *Today*: 🟢 {w}  🔴 {l}  ⚪️ {be}  |  WR: {wr:.1f}%  |  Alerts: {total}"
-
-def format_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score, extras=None, override_note=None):
-    ex = f"\n{extras}" if extras else ""
-    ov = f"\n🕒 Cooldown override: {override_note}" if override_note else ""
-    return (
-f"🔔 *TRADE ALERT*\n"
-f"• Pair: `{pair}`  • TF: *{tf}*\n"
-f"• Direction: *{direction}*\n"
-f"• Entry: `{entry:.6f}`\n"
-f"• SL: `{sl:.6f}`   • TP1 *(move SL→BE)*: `{tp1:.6f}`   • TP2 *(WIN)*: `{tp2:.6f}`\n"
-f"• Why: {reason}\n"
-f"• Score: *{score}/10*\n"
-f"{leaderboard_line()}{ex}{ov}"
-)
-
-def format_manage(pair, tf, direction, entry, tp2, new_sl):
-    return (
-f"🛡️ *MANAGE*: Move SL → BE+{TP1_BE_OFFSET_R:.1f}R\n"
-f"• Pair: `{pair}`  • TF: *{tf}*  • Direction: *{direction}*\n"
-f"• New SL: `{new_sl:.6f}`\n"
-f"• Targeting TP2: `{tp2:.6f}`\n"
-f"{leaderboard_line()}"
-)
-
-def format_result(pair, tf, direction, result, entry, sl, tp1=None, tp2=None):
-    extra = ""
-    if tp2 is not None: extra += f"  • TP2: `{tp2:.6f}`"
-    if tp1 is not None: extra = (f"  • TP1: `{tp1:.6f}`") + extra
-    emoji = "🟢" if "WIN" in result else ("🔴" if "LOSS" in result else "⚪️")
-    return (
-f"{emoji} *RESULT* — {result}\n"
-f"• Pair: `{pair}`  • TF: *{tf}*  • Direction: *{direction}*\n"
-f"• Entry: `{entry:.6f}`  • SL: `{sl:.6f}`{extra}\n"
-f"{leaderboard_line()}"
-)
-
-def format_stats_line():
-    return f"📆 *Daily Stats*\n{leaderboard_line()}"
-
-# ========= SIGNAL DETECTION =========
-def detect_signal(sym, tf, last_closed_row, prev_row=None, buf=None):
-    close_time = int(last_closed_row[6])
-    o = float(last_closed_row[1]); c = float(last_closed_row[4])
-    h = float(last_closed_row[2]); l = float(last_closed_row[3])
-    v = float(last_closed_row[5])
-
-    po = pc = ph = pl = None
+def detect_signal(sym, tf, last_row, prev_row, buf):
+    ct=int(last_row[6]); o=float(last_row[1]); c=float(last_row[4]); h=float(last_row[2]); l=float(last_row[3]); v=float(last_row[5])
+    if buf['last_close'] and ct<=buf['last_close']: return None
+    if min(len(buf['vol']),len(buf['hi']),len(buf['lo']),len(buf['cl']))<20:
+        buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=ct; return None
+    hi_hist,lo_hist,cl_hist=list(buf['hi']),list(buf['lo']),list(buf['cl'])
+    prev_hi=max(hi_hist[-BREAKOUT_LOOKBACK_BARS:]); prev_lo=min(lo_hist[-BREAKOUT_LOOKBACK_BARS:])
+    avg_vol=sum(buf['vol'])/len(buf['vol'])
+    if v < avg_vol*VOL_SURGE_MIN:
+        buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=ct; return None
+    atr=true_atr(hi_hist,lo_hist,cl_hist) or (BREAKOUT_PAD_BPS/10000.0)*c
+    pad=(atr*(0.30 if tf=="15m" else (0.24 if tf=="30m" else 0.20))) if isinstance(atr,float) else atr
+    long_break=c>(prev_hi+pad); short_break=c<(prev_lo-pad)
+    bull=bear=False
     if prev_row:
-        po = float(prev_row[1]); pc = float(prev_row[4])
-        ph = float(prev_row[2]); pl = float(prev_row[3])
-
-    if buf is None: return None
-    if buf['last_close'] and close_time <= buf['last_close']:
-        return None
-    if len(buf['vol']) < 20 or len(buf['hi']) < 20 or len(buf['lo']) < 20 or len(buf['cl']) < 20:
-        buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
-        return None
-
-    hi_hist = list(buf['hi'])
-    lo_hist = list(buf['lo'])
-    cl_hist = list(buf['cl'])
-
-    prev_range_hi = max(hi_hist[-BREAKOUT_LOOKBACK_BARS:]) if hi_hist else None
-    prev_range_lo = min(lo_hist[-BREAKOUT_LOOKBACK_BARS:]) if lo_hist else None
-
-    avg_vol = sum(buf['vol'])/len(buf['vol'])
-    vol_ok  = v >= avg_vol * VOL_SURGE_MIN
-    if (not vol_ok) or (prev_range_hi is None) or (prev_range_lo is None):
-        buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
-        for k in ("hi","lo","cl","vol"):
-            if len(buf[k])>64: buf[k].popleft()
-        return None
-
-    atr = true_atr(hi_hist, lo_hist, cl_hist, period=14)
-    if atr is not None:
-        scale = {"15m":0.30, "30m":0.24, "1h":0.20}.get(tf, 0.24)
-        pad_abs = atr * scale
-    else:
-        pad_abs = (BREAKOUT_PAD_BPS/10000.0) * c
-
-    long_break  = c > (prev_range_hi + pad_abs)
-    short_break = c < (prev_range_lo - pad_abs)
-
-    bull_engulf = bear_engulf = False
-    if prev_row is not None:
-        prev_bear = pc < po
-        prev_bull = pc > po
-        body_engulf_up   = (c > o) and prev_bear and (c >= po) and (o <= pc)
-        body_engulf_down = (c < o) and prev_bull and (c <= po) and (o >= pc)
-        lo10 = min(lo_hist[-10:]) if lo_hist else None
-        hi10 = max(hi_hist[-10:]) if hi_hist else None
-        sweep_down = (lo10 is not None) and (l <= lo10)
-        sweep_up   = (hi10 is not None) and (h >= hi10)
-        bull_engulf = body_engulf_up and sweep_down
-        bear_engulf = body_engulf_down and sweep_up
-
-    if prev_row is not None and (long_break or short_break):
-        is_inside = (h <= ph) and (l >= pl)
-        if is_inside:
-            long_break = False
-            short_break = False
-
-    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
-    for k in ("hi","lo","cl","vol"):
+        po,pc,ph,pl=float(prev_row[1]),float(prev_row[4]),float(prev_row[2]),float(prev_row[3])
+        body_up=(c>o) and (pc<po) and (c>=po) and (o<=pc)
+        body_dn=(c<o) and (pc>po) and (c<=po) and (o>=pc)
+        lo10=min(lo_hist[-10:]); hi10=max(hi_hist[-10:])
+        bull=body_up and (l<=lo10); bear=body_dn and (h>=hi10)
+        if (long_break or short_break) and (h<=ph and l>=pl): long_break=short_break=False
+    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=ct
+    for k in("hi","lo","cl","vol"):
         if len(buf[k])>64: buf[k].popleft()
-
-    if long_break:
-        return {"direction":"Long","close":c,"open":o,"prev_hi":prev_range_hi,"prev_lo":prev_range_lo,
-                "is_breakout":True,"is_engulf":False,"hi":h,"lo":l}
-    if short_break:
-        return {"direction":"Short","close":c,"open":o,"prev_hi":prev_range_hi,"prev_lo":prev_range_lo,
-                "is_breakout":True,"is_engulf":False,"hi":h,"lo":l}
-    if bull_engulf:
-        return {"direction":"Long","close":c,"open":o,"prev_hi":prev_range_hi,"prev_lo":prev_range_lo,
-                "is_breakout":False,"is_engulf":True,"hi":h,"lo":l}
-    if bear_engulf:
-        return {"direction":"Short","close":c,"open":o,"prev_hi":prev_range_hi,"prev_lo":prev_range_lo,
-                "is_breakout":False,"is_engulf":True,"hi":h,"lo":l}
+    if long_break:  return {"dir":"Long","c":c,"o":o,"prev_hi":prev_hi,"prev_lo":prev_lo,"is_bo":True,"hi":h,"lo":l}
+    if short_break: return {"dir":"Short","c":c,"o":o,"prev_hi":prev_hi,"prev_lo":prev_lo,"is_bo":True,"hi":h,"lo":l}
+    if bull: return {"dir":"Long","c":c,"o":o,"prev_hi":prev_hi,"prev_lo":prev_lo,"is_bo":False,"hi":h,"lo":l}
+    if bear: return {"dir":"Short","c":c,"o":o,"prev_hi":prev_hi,"prev_lo":prev_lo,"is_bo":False,"hi":h,"lo":l}
     return None
+
+def pick_swing_levels(tf, highs, lows, closes):
+    n=tf_swing_window(tf)
+    hi_list=list(highs)[-max(5,n*2):]; lo_list=list(lows)[-max(5,n*2):]
+    fh,fl=[],[]
+    for i in range(1,len(hi_list)):
+        if hi_list[i]<=hi_list[i-1] and lo_list[i]>=lo_list[i-1]: continue
+        fh.append(hi_list[i]); fl.append(lo_list[i])
+    if not fh or not fl: fh,fl=hi_list,lo_list
+    sl_long=min(fl[-n:]) if len(fl)>=n else min(fl) if fl else None
+    sl_short=max(fh[-n:]) if len(fh)>=n else max(fh) if fh else None
+    return sl_long, sl_short
+
+# ========= TAPE / MICRO =========
+def update_micro(sym, spread, depth_usd):
+    micro_hist[sym]["spread"].append(max(1e-12,spread))
+    micro_hist[sym]["depth"].append(max(0.0,depth_usd))
+
+def micro_thresholds(sym):
+    s=list(micro_hist[sym]["spread"]); d=list(micro_hist[sym]["depth"])
+    if len(s)<25 or len(d)<25: return SPREAD_MAX_ABS, DEPTH_1PCT_MIN_USD
+    p60=percentile(s,60) or SPREAD_MAX_ABS; p40=percentile(d,40) or DEPTH_1PCT_MIN_USD
+    return min(max(SPREAD_MAX_ABS, p60*1.2), SPREAD_MAX_ABS*2.0), max(min(DEPTH_1PCT_MIN_USD, p40*0.9), DEPTH_1PCT_MIN_USD*0.6)
+
+def depth_checks(orderbook, direction, max_spread, min_depth, contract_size):
+    try:
+        a0=orderbook['asks'][0]; b0=orderbook['bids'][0]
+        ask=float(a0[0]); bid=float(b0[0])
+        spread=(ask-bid)/max(1e-12,(ask+bid)/2)
+        if spread>max_spread: return False,spread,0,0,0
+        up=ask*1.01; dn=bid*0.99
+        def sum_usd(side,cond):
+            s=0.0
+            for row in side:
+                p=float(row[0]); q=float(row[1])
+                if cond(p): s+=p*(q*contract_size)
+            return s
+        ask_usd=sum_usd(orderbook['asks'], lambda p:p<=up); bid_usd=sum_usd(orderbook['bids'], lambda p:p>=dn)
+        total=ask_usd+bid_usd
+        if total<min_depth: return False,spread,bid_usd,ask_usd,total
+        if direction=="Long":
+            if bid_usd<min_depth*0.45: return False,spread,bid_usd,ask_usd,total
+            if (bid_usd/max(1e-9,total))<0.52: return False,spread,bid_usd,ask_usd,total
+        else:
+            if ask_usd<min_depth*0.45: return False,spread,bid_usd,ask_usd,total
+            if (ask_usd/max(1e-9,total))<0.52: return False,spread,bid_usd,ask_usd,total
+        return True,spread,bid_usd,ask_usd,total
+    except: return False,1.0,0,0,0
+
+async def tape_tilt(session, sym):
+    d=await mx_deals(session, to_mexc(sym), limit=100)
+    data=d.get("data") if isinstance(d,dict) else d
+    if not data: return 0.0,0.0
+    buy=sell=0.0; cs=symbol_meta.get(sym,{}).get("contractSize",1.0)
+    for t in data:
+        try:
+            price=float(t.get("p",t.get("price",0.0))); qty=float(t.get("v",t.get("qty",0.0))); typ=int(t.get("T",t.get("type",0)))
+        except: continue
+        notional=price*(qty*cs); 
+        if notional<=0: continue
+        if typ==1: buy+=notional
+        elif typ==2: sell+=notional
+    tot=buy+sell
+    return ((buy-sell)/tot, tot) if tot>0 else (0.0,0.0)
+
+# ========= FETCH LAST CLOSED BAR =========
+async def fetch_closed(session, sym, tf):
+    data=await mx_kline(session, to_mexc(sym), tf, limit=3)
+    if not data or len(data)<3: return None,None
+    prev,last=data[-2],data[-1]
+    if int(last[6])<=now_ms()-1000: return prev,last
+    await asyncio.sleep(1.0)
+    data2=await mx_kline(session, to_mexc(sym), tf, limit=3)
+    if data2 and len(data2)>=3 and int(data2[-1][6])<=now_ms()-1000: return data2[-2],data2[-1]
+    return data[-3],data[-2]
+
+# ========= FORMATTING =========
+def leaderboard_line():
+    total=stats["unique"]; w=stats["wins"]; l=stats["losses"]; be=stats["breakevens"]
+    wr=(w/total*100.0) if total>0 else 0.0
+    return f"ð *Today*: ð¢ {w}  ð´ {l}  âªï¸ {be}  |  WR: {wr:.1f}%  |  Alerts: {total}"
+
+def fmt_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score, extras=""):
+    ex=f"\n{extras}" if extras else ""
+    return (f"ð *TRADE ALERT*\nâ¢ Pair: `{pair}`  â¢ TF: *{tf}*\nâ¢ Direction: *{direction}*\n"
+            f"â¢ Entry: `{entry:.6f}`\nâ¢ SL: `{sl:.6f}`   â¢ TP1 *(SLâBE)*: `{tp1:.6f}`   â¢ TP2 *(WIN)*: `{tp2:.6f}`\n"
+            f"â¢ Why: {reason}\nâ¢ Score: *{score}/10*\n{leaderboard_line()}{ex}")
+
+def fmt_manage(pair, tf, direction, entry, tp2, new_sl):
+    return (f"ð¡ï¸ *MANAGE*: Move SL â BE+{TP1_BE_OFFSET_R:.1f}R\nâ¢ Pair: `{pair}`  â¢ TF: *{tf}*  â¢ Direction: *{direction}*\n"
+            f"â¢ New SL: `{new_sl:.6f}`\nâ¢ Targeting TP2: `{tp2:.6f}`\n{leaderboard_line()}")
+
+def fmt_result(pair, tf, direction, result, entry, sl, tp1=None, tp2=None):
+    extra=("" if tp1 is None else f"  â¢ TP1: `{tp1:.6f}`")+("" if tp2 is None else f"  â¢ TP2: `{tp2:.6f}`")
+    emoji="ð¢" if "WIN" in result else ("ð´" if "LOSS" in result else "âªï¸")
+    return (f"{emoji} *RESULT* â {result}\nâ¢ Pair: `{pair}`  â¢ TF: *{tf}*  â¢ Direction: *{direction}*\n"
+            f"â¢ Entry: `{entry:.6f}`  â¢ SL: `{sl:.6f}`{extra}\n{leaderboard_line()}")
 
 # ========= SCAN LOOP =========
 async def scan_loop(session, symbols, tf):
     while True:
-        await asyncio.sleep(max(0, next_close_ms(tf) - now_ms() + 500)/1000 + random.random()*0.35)
-        if not macro_ok():
-            continue
-
-        sem = asyncio.Semaphore(6)
-        alerts = []
+        await asyncio.sleep(max(0, next_close_ms(tf)-now_ms()+500)/1000 + random.random()*0.25)
+        if not macro_ok(): continue
+        alerts=[]
 
         async def process(sym):
             nonlocal alerts
-            async with sem:
-                if sym in dead_symbols: return
-                await asyncio.sleep(random.random()*0.15)
-                prev, last_closed = await fetch_closed_kline(session, sym, tf)
-                if not last_closed: return
+            await asyncio.sleep(random.random()*0.12)
+            prev,last=await fetch_closed(session, sym, tf)
+            if not last: return
+            sig=detect_signal(sym, tf, last, prev, kbuf[sym][tf])
+            if not sig: drop_counters["no_signal"]+=1; return
 
-                buf = kbuf[sym][tf]
-                sig = detect_signal(sym, tf, last_closed, prev_row=prev, buf=buf)
-                if not sig:
-                    drop_counters["no_signal"] += 1
-                    return
+            # Funding
+            fr=await mx_funding_rate(session, to_mexc(sym))
+            if fr is None: drop_counters["funding_missing"]+=1; return
+            if sig["dir"]=="Long" and fr>FUNDING_MAX_ABS: drop_counters["funding_long_block"]+=1; return
+            if sig["dir"]=="Short" and fr<-FUNDING_MAX_ABS: drop_counters["funding_short_block"]+=1; return
 
-                # Funding bias
-                finfo = await md_funding(session, sym)
-                if not finfo:
-                    drop_counters["funding_missing"] += 1
-                    return
-                fr = float(finfo.get('lastFundingRate', finfo.get('fundingRate', 0.0)))
-                if sig['direction']=="Long" and fr > FUNDING_MAX_ABS*1.2:
-                    drop_counters["funding_long_block"] += 1; return
-                if sig['direction']=="Short" and fr < -FUNDING_MAX_ABS*1.2:
-                    drop_counters["funding_short_block"] += 1; return
+            # OI (soft gate)
+            oi_pct=_oi_5m_from_queue(oi_hist[sym]); thr=adaptive_oi_threshold(sym)
+            oi_soft_fail=False
+            if oi_pct is not None:
+                if sig["dir"]=="Long" and not (sig["c"]>sig["o"] and oi_pct>=+thr): oi_soft_fail=True
+                if sig["dir"]=="Short" and not (sig["c"]<sig["o"] and oi_pct<=-thr): oi_soft_fail=True
+            if HARD_REQUIRE_OI and oi_soft_fail: drop_counters["oi_hard_block"]+=1; return
 
-                # OI alignment
-                oi_pct = oi_5min_change_pct_from_queue(sym)
-                if oi_pct is None and DATA_SOURCE == "binance":
-                    oi_pct = await bn_oi5m_change_pct(session, sym)
-                adaptive_thr = adaptive_oi_threshold(sym)
-                oi_soft_fail = False
-                c, o = sig['close'], sig['open']
-                if oi_pct is None:
-                    oi_soft_fail = not HARD_REQUIRE_OI
+            # Depth / spread
+            ob=await mx_depth(session, to_mexc(sym))
+            if not ob or not ob.get("asks") or not ob.get("bids"): drop_counters["depth_missing"]+=1; return
+            cs=symbol_meta.get(sym,{}).get("contractSize",1.0)
+            try:
+                ask=float(ob["asks"][0][0]); bid=float(ob["bids"][0][0])
+                spread=(ask-bid)/max(1e-12,(ask+bid)/2)
+                up, dn=ask*1.01, bid*0.99
+                ask_usd=sum(float(p)*float(q)*cs for p,q,*_ in ob["asks"] if float(p)<=up)
+                bid_usd=sum(float(p)*float(q)*cs for p,q,*_ in ob["bids"] if float(p)>=dn)
+                update_micro(sym, spread, ask_usd+bid_usd)
+            except: pass
+            max_sp, min_dp = micro_thresholds(sym)
+            ok, spread, bid_usd, ask_usd, depth_usd = depth_checks(ob, sig["dir"], max_sp, min_dp, cs)
+            if not ok: drop_counters["depth_fail"]+=1; return
+
+            # Correlation (soft)
+            corr_soft, btc5m, eth5m = await correlation_soft_flag(session, sig["dir"])
+            if CORR_HARD_BLOCK and ((sig["dir"]=="Long" and (btc5m<-0.007 or eth5m<-0.007)) or (sig["dir"]=="Short" and (btc5m>0.007 or eth5m>0.007))):
+                drop_counters["corr_hard_block"]+=1; return
+
+            # SL/TP + RR
+            sl_long, sl_short = pick_swing_levels(tf, kbuf[sym][tf]['hi'], kbuf[sym][tf]['lo'], kbuf[sym][tf]['cl'])
+            entry=sig["c"]
+            if sig["dir"]=="Long" and sl_long is not None:
+                risk=max(1e-9, entry-sl_long); tp1=entry+1.10*risk; tp2=entry+2.00*risk; sl=sl_long
+            elif sig["dir"]=="Short" and sl_short is not None:
+                risk=max(1e-9, sl_short-entry); tp1=entry-1.10*risk; tp2=entry-2.00*risk; sl=sl_short
+            else: drop_counters["sl_missing"]+=1; return
+            if not rr_ok(entry, sl, tp1): drop_counters["rr_fail"]+=1; return
+            if abs(entry-sl)/max(1e-12,entry)>MAX_RISK_PCT: drop_counters["risk_pct_high"]+=1; return
+
+            # Cooldown
+            now_s=int(time.time())
+            if now_s - last_alert_at[sym][tf] < COOLDOWN_SEC:
+                be_ts=last_be_at[sym][tf]; used=be_override_used_at[sym][tf]
+                if be_ts and (now_s-be_ts<=600) and (now_s-used>600): be_override_used_at[sym][tf]=now_s
+                else: drop_counters["cooldown_suppressed"]+=1; return
+            last_alert_at[sym][tf]=now_s
+
+            # Scoring (lenient)
+            h,l=sig.get("hi",entry),sig.get("lo",entry); cr=max(1e-9,h-l); clv=(sig["c"]-l)/cr
+            break_q = (entry - sig["prev_hi"])/max(1e-9,cr) if (sig["is_bo"] and sig["dir"]=="Long") else ((sig["prev_lo"]-entry)/max(1e-9,cr) if sig["is_bo"] else 0.0)
+            score = 6
+            info=[f"Volâ¥{VOL_SURGE_MIN:.2f}x", f"Funding {fr*100:.3f}%", f"Spread {spread*100:.3f}%", f"Depth1% ${depth_usd:,.0f}"]
+            if oi_pct is None: info.append("OI missing")
+            else: info.append(f"OIÎ5m {oi_pct*100:.2f}% (thr {adaptive_oi_threshold(sym)*100:.2f}%)")
+            if oi_soft_fail: score-=1; info.append("OI misalign")
+            else: score+=1
+            if corr_soft: score-=1; info.append(f"Corr soft BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
+            else: score+=1
+            if clv>=0.6 and sig["dir"]=="Long": score+=1; info.append("Strong close" if sig["dir"]=="Long" else "")
+            if clv<=0.4 and sig["dir"]=="Short": score+=1
+            if break_q>=0.2: score+=1; info.append("Clean break")
+
+            if HARD_BLOCK_SOFT_SESSION_BREAKOUT and sig["is_bo"] and (session_soft_flag(tf, list(kbuf[sym][tf]['cl'])) is True):
+                drop_counters["soft_session_breakout_block"]+=1; return
+
+            need_tape = TAPE_REQUIRE_ALWAYS or (score >= 2 and score < 6)
+            if need_tape:
+                tilt,notional=await tape_tilt(session, sym)
+                if TAPE_REQUIRE_ALWAYS:
+                    if notional<TAPE_MIN_NOTIONAL: drop_counters["tape_notional_low"]+=1; return
+                    if sig["dir"]=="Long" and tilt<TAPE_TILT_WEAK: drop_counters["tape_tilt_fail"]+=1; return
+                    if sig["dir"]=="Short" and tilt>-TAPE_TILT_WEAK: drop_counters["tape_tilt_fail"]+=1; return
+                if sig["dir"]=="Long":
+                    score += 2 if tilt>=TAPE_TILT_STRONG else (1 if tilt>=TAPE_TILT_WEAK else (-1 if tilt<=-TAPE_TILT_WEAK else 0))
                 else:
-                    if sig['direction']=="Long":
-                        if not (c>o and oi_pct >= +adaptive_thr): oi_soft_fail = True
-                    else:
-                        if not (c<o and oi_pct <= -adaptive_thr): oi_soft_fail = True
-                if (HARD_REQUIRE_OI and oi_soft_fail):
-                    drop_counters["oi_hard_block"] += 1; return
+                    score += 2 if tilt<=-TAPE_TILT_STRONG else (1 if tilt<=-TAPE_TILT_WEAK else (-1 if tilt>=TAPE_TILT_WEAK else 0))
+                info.append(f"Tape {tilt*100:.1f}% on ${notional:,.0f}")
 
-                # Orderbook microstructure
-                ob = await md_depth(session, sym, limit=100)
-                if not ob or not ob.get('asks') or not ob.get('bids'):
-                    drop_counters["depth_missing"] += 1; return
+            req={"15m":MIN_CONF_15M,"30m":MIN_CONF_30M,"1h":MIN_CONF_1H}[tf] + (LONG_SIDE_PENALTY if sig["dir"]=="Long" else 0)
+            final=max(1,min(10,score))
+            if final<req: drop_counters["score_below_min"]+=1; return
 
-                cs = symbol_meta.get(sym,{}).get("contractSize",1.0)
-                try:
-                    a0 = float(ob['asks'][0][0]); b0 = float(ob['bids'][0][0])
-                    spread_raw = (a0 - b0) / max(1e-12, ((a0+b0)/2))
-                    up_lim  = a0 * 1.01; dn_lim = b0 * 0.99
-                    ask_usd = sum(float(p)* (float(q)*cs) for p,q,*_ in ob['asks'] if float(p)<=up_lim)
-                    bid_usd = sum(float(p)* (float(q)*cs) for p,q,*_ in ob['bids'] if float(p)>=dn_lim)
-                    depth_total = ask_usd + bid_usd
-                    update_micro_profile(sym, spread_raw, depth_total)
-                except Exception:
-                    pass
-
-                max_spread_allowed, min_depth_required = adaptive_micro_thresholds(sym)
-                ok_depth, spread, bid_usd, ask_usd, depth_usd = depth_checks_side(ob, sig['direction'], max_spread_allowed, min_depth_required, contract_size=cs)
-                if not ok_depth:
-                    drop_counters["depth_fail"] += 1; return
-
-                # Correlation (cached 10s)
-                corr_soft, btc5m, eth5m = await correlation_soft_flag(session, sig['direction'])
-                if CORR_HARD_BLOCK:
-                    if sig['direction']=="Long" and (btc5m < -0.007 or eth5m < -0.007):
-                        drop_counters["corr_hard_block"] += 1; return
-                    if sig['direction']=="Short" and (btc5m >  0.007 or eth5m >  0.007):
-                        drop_counters["corr_hard_block"] += 1; return
-
-                # SL/TP + RR
-                buf_local = kbuf[sym][tf]
-                sl_long, sl_short = pick_swing_levels(tf, buf_local['hi'], buf_local['lo'], buf_local['cl'])
-                entry = sig['close']
-                if sig['direction']=="Long" and sl_long is not None:
-                    risk = max(1e-9, entry - sl_long)
-                    tp1  = entry + 1.10*risk
-                    tp2  = entry + 2.00*risk
-                    sl   = sl_long
-                elif sig['direction']=="Short" and sl_short is not None:
-                    risk = max(1e-9, sl_short - entry)
-                    tp1  = entry - 1.10*risk
-                    tp2  = entry - 2.00*risk
-                    sl   = sl_short
-                else:
-                    drop_counters["sl_missing"] += 1; return
-
-                if not rr_ok(entry, sl, tp1, min_r=1.0):
-                    drop_counters["rr_fail"] += 1; return
-                risk_pct = abs(entry - sl)/max(1e-12, entry)
-                if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
-                    drop_counters["risk_pct_too_high"] += 1; return
-
-                # Debounce with BE override
-                now_s = int(time.time())
-                override_note = None
-                if now_s - last_alert_at[sym][tf] < COOLDOWN_SEC:
-                    be_ts = last_be_at[sym][tf]
-                    used_ts = be_override_used_at[sym][tf]
-                    if be_ts and (now_s - be_ts <= BE_OVERRIDE_WINDOW_SEC) and (now_s - used_ts > BE_OVERRIDE_WINDOW_SEC):
-                        override_note = "last trade hit TP1→BE"
-                        be_override_used_at[sym][tf] = now_s
-                    else:
-                        drop_counters["cooldown_suppressed"] += 1; return
-                last_alert_at[sym][tf] = now_s
-
-                # Confidence prelim
-                h = sig.get("hi", entry); l = sig.get("lo", entry)
-                cr = max(1e-9, h - l)
-                clv_curr = (sig['close'] - l)/cr
-                break_quality = 0.0
-                if sig["is_breakout"]:
-                    if sig['direction']=="Long": break_quality = (entry - sig['prev_hi']) / max(1e-9, cr)
-                    else:                         break_quality = (sig['prev_lo'] - entry) / max(1e-9, cr)
-
-                score = 6
-                info_bits = [
-                    f"Vol≥{VOL_SURGE_MIN:.2f}x",
-                    f"Funding {fr*100:.3f}%",
-                    f"Spread {spread*100:.3f}% (max {max_spread_allowed*100:.3f}%)",
-                    f"Depth1% ${depth_usd:,.0f} (min ${min_depth_required:,.0f})",
-                ]
-                if oi_pct is None: info_bits.append("OI missing")
-                else: info_bits.append(f"OIΔ5m {oi_pct*100:.2f}% (thr {adaptive_thr*100:.2f}%)")
-                if oi_soft_fail: score -= 1; info_bits.append("OI-price misalign")
-                else:            score += 1
-                if corr_soft:    score -= 1; info_bits.append(f"Corr soft: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
-                else:            score += 1
-                sess_flag = session_soft_flag(tf, list(buf_local['cl']))
-                if sess_flag is None: info_bits.append("Session neutral")
-                elif sess_flag:       score -= 1; info_bits.append("Session soft")
-                else:                 score += 1
-                if sig['direction']=="Long" and clv_curr >= 0.65: score += 1; info_bits.append("Strong close")
-                if sig['direction']=="Short" and clv_curr <= 0.35: score += 1; info_bits.append("Strong close")
-                if break_quality >= 0.25: score += 1; info_bits.append("Clean break")
-
-                # HARD BLOCK: breakout during soft session
-                if HARD_BLOCK_SOFT_SESSION_BREAKOUT and sig["is_breakout"] and (sess_flag is True):
-                    drop_counters["soft_session_breakout_block"] += 1; return
-
-                # Tape tilt
-                tape_score = 0
-                need_tape = TAPE_REQUIRE_ALWAYS or (score >= MIN_CONF-1 and score < MIN_CONF+2)
-                if need_tape:
-                    tilt, tnotional = await tape_tilt(session, sym)
-                    tape_note = f"Tape tilt {tilt*100:.1f}% on ${tnotional:,.0f}"
-                    weak = TAPE_TILT_WEAK
-                    strong = TAPE_TILT_STRONG
-                    if TAPE_REQUIRE_ALWAYS:
-                        if tnotional < TAPE_MIN_NOTIONAL:
-                            drop_counters["tape_notional_low"] += 1; return
-                        if sig['direction']=="Long" and tilt <  weak:
-                            drop_counters["tape_tilt_fail"] += 1; return
-                        if sig['direction']=="Short" and tilt > -weak:
-                            drop_counters["tape_tilt_fail"] += 1; return
-                    if sig['direction']=="Long":
-                        if tilt >= strong: tape_score += 2
-                        elif tilt >= weak: tape_score += 1
-                        elif tilt <= -weak: tape_score -= 1
-                    else:
-                        if tilt <= -strong: tape_score += 2
-                        elif tilt <= -weak: tape_score += 1
-                        elif tilt >=  weak:  tape_score -= 1
-                    info_bits.append(tape_note)
-                    score += tape_score
-
-                final_score = max(1, min(10, score))
-
-                # Per-TF MIN_CONF + long penalty
-                req_by_tf = {"15m": MIN_CONF_15M, "30m": MIN_CONF_30M, "1h": MIN_CONF_1H}
-                required = req_by_tf.get(tf, MIN_CONF) + (LONG_SIDE_PENALTY if sig["direction"]=="Long" else 0)
-                if final_score < required:
-                    drop_counters["score_below_min"] += 1; return
-
-                # Dedup + stats
-                key = trade_key(sym, tf, sig['direction'], entry)
-                nowm = now_ms()
-                is_unique = True
-                while dedup_seen and nowm - dedup_seen[0][1] > DEDUP_MIN*60*1000:
-                    dedup_seen.popleft()
-                for k, ts in dedup_seen:
-                    if k == key:
-                        is_unique = False
-                        break
-                if is_unique:
-                    dedup_seen.append((key, nowm))
-                    stats["unique"] += 1
-                    current_day_keys.add(key)
-                    R = abs(entry - sl)
-                    early_ms = nowm + int(EARLY_EXIT_CHECK_FRAC * tf_timeout_minutes(tf) * 60 * 1000)
-                    active_trades[key] = {
-                        "symbol": sym, "tf": tf, "direction": sig['direction'],
-                        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
-                        "start_ms": nowm, "be_moved": False,
-                        "r": R, "mfe_r": 0.0, "early_check_ms": early_ms
-                    }
-                    alert_counts[tf] = alert_counts.get(tf, 0) + 1
-
-                reason_prefix = "🚀 Breakout + TRUE-ATR pad" if sig["is_breakout"] else "🔄 Engulfing reversal + sweep"
-                extras = f"CLV:{clv_curr:.2f}  BreakQ:{break_quality:.2f}  BidDepth:${bid_usd:,.0f}  AskDepth:${ask_usd:,.0f}"
-                alert_text = format_alert(sym, sig['direction'], entry, sl, tp1, tp2,
-                                 reason_prefix + "; " + ", ".join(info_bits), tf, final_score, extras, override_note)
-                alerts.append(alert_text)
+            # Dedup + record
+            key=trade_key(sym, tf, sig["dir"], entry); nowm=now_ms()
+            while dedup_seen and nowm-dedup_seen[0][1]>DEDUP_MIN*60*1000: dedup_seen.popleft()
+            if any(k==key for k,_ in dedup_seen): return
+            dedup_seen.append((key,nowm)); stats["unique"]+=1; current_day_keys.add(key)
+            R=abs(entry-sl); early=nowm+int(EARLY_EXIT_CHECK_FRAC*tf_timeout_minutes(tf)*60*1000)
+            active_trades[key]={"symbol":sym,"tf":tf,"direction":sig["dir"],"entry":entry,"sl":sl,"tp1":tp1,"tp2":tp2,
+                                "start_ms":nowm,"be_moved":False,"r":R,"mfe_r":0.0,"early_check_ms":early}
+            alert_counts[tf]=alert_counts.get(tf,0)+1
+            extras=f"CLV:{clv:.2f} BreakQ:{break_q:.2f} BidDepth:${bid_usd:,.0f} AskDepth:${ask_usd:,.0f}"
+            alerts.append(fmt_alert(sym, sig["dir"], entry, sl, tp1, tp2, ("ð Breakout" if sig["is_bo"] else "ð Engulf"), tf, final, extras))
 
         await asyncio.gather(*(process(s) for s in symbols))
         await tg_send_batched(session, alerts)
 
 # ========= RESULT RESOLVER =========
-async def result_resolver_loop(session):
+async def md_book_ticker(session, sym):
+    d=await mx_ticker(session, to_mexc(sym))
+    if not d: return None
+    return {"bidPrice":str(d.get("bid1", d.get("lastPrice",0))), "askPrice":str(d.get("ask1", d.get("lastPrice",0)))}
+
+async def result_resolver(session):
     while True:
-        if not active_trades:
-            await asyncio.sleep(3); continue
-        keys = list(active_trades.keys())
-        sem = asyncio.Semaphore(10)
-        async def resolve_one(k):
-            async with sem:
-                tr = active_trades.get(k)
-                if not tr: return
-                sym, direction = tr["symbol"], tr["direction"]
-                entry, sl, tp1, tp2 = tr["entry"], tr["sl"], tr["tp1"], tr["tp2"]
-                tf = tr["tf"]
-                start_ms = tr["start_ms"]
+        if not active_trades: await asyncio.sleep(3); continue
+        keys=list(active_trades.keys())
 
-                # Early exit check (no progress)
-                R = tr.get("r", max(1e-9, abs(entry - sl)))
-                jt0 = await md_book_ticker(session, sym)
-                if not jt0: return
-                bid0 = float(jt0["bidPrice"]); ask0 = float(jt0["askPrice"])
-                if direction == "Long":
-                    tr["mfe_r"] = max(tr.get("mfe_r",0.0), (bid0 - entry)/max(1e-9, R))
+        async def one(k):
+            tr=active_trades.get(k); if not tr: return
+            sym=tr["symbol"]; direction=tr["direction"]; entry,sl,tp1,tp2=tr["entry"],tr["sl"],tr["tp1"],tr["tp2"]; tf=tr["tf"]
+            R=tr.get("r",max(1e-9,abs(entry-sl)))
+            jt0=await md_book_ticker(session, sym); if not jt0: return
+            bid0=float(jt0["bidPrice"]); ask0=float(jt0["askPrice"])
+            if direction=="Long": tr["mfe_r"]=max(tr.get("mfe_r",0.0),(bid0-entry)/max(1e-9,R))
+            else: tr["mfe_r"]=max(tr.get("mfe_r",0.0),(entry-ask0)/max(1e-9,R))
+
+            if now_ms()>=tr.get("early_check_ms",0) and tr["mfe_r"]<EARLY_EXIT_MIN_MFE_R:
+                del active_trades[k]; await tg_send(session, fmt_result(sym, tf, direction, "EARLY EXIT (no progress)", entry, tr["sl"], tp1, tp2)); return
+
+            if now_ms()-tr["start_ms"]>tf_timeout_minutes(tf)*60*1000:
+                del active_trades[k]; await tg_send(session, fmt_result(sym, tf, direction, "TIMEOUT (no follow-through)", entry, tr["sl"], tp1, tp2)); return
+
+            jt=await md_book_ticker(session, sym); if not jt: return
+            bid=float(jt["bidPrice"]); ask=float(jt["askPrice"])
+
+            if direction=="Long":
+                if not tr["be_moved"]:
+                    if bid>=tp1:
+                        trail=entry+(TP1_BE_OFFSET_R*(entry-tr["sl"])); tr["be_moved"]=True; tr["sl"]=trail
+                        last_be_at[sym][tf]=int(time.time()); await tg_send(session, fmt_manage(sym, tf, direction, entry, tp2, trail))
+                    elif ask<=tr["sl"]:
+                        stats["losses"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
                 else:
-                    tr["mfe_r"] = max(tr.get("mfe_r",0.0), (entry - ask0)/max(1e-9, R))
-
-                if now_ms() >= tr.get("early_check_ms", 0):
-                    if tr["mfe_r"] < EARLY_EXIT_MIN_MFE_R:
-                        # early exit NOT counted as loss
-                        del active_trades[k]
-                        await tg_send(session, format_result(sym, tf, direction, "EARLY EXIT (no progress)", entry, tr["sl"], tp1, tp2))
-                        return
-
-                # Timeout => not counted as loss
-                if now_ms() - start_ms > tf_timeout_minutes(tf)*60*1000:
-                    del active_trades[k]
-                    await tg_send(session, format_result(sym, tf, direction, "TIMEOUT (no follow-through)", entry, tr["sl"], tp1, tp2))
-                    return
-
-                # Live check
-                jt = await md_book_ticker(session, sym)
-                if not jt: return
-                bid = float(jt["bidPrice"]); ask = float(jt["askPrice"])
-
-                if direction == "Long":
-                    if not tr["be_moved"]:
-                        if bid >= tp1:
-                            trail = entry + (TP1_BE_OFFSET_R * (entry - tr["sl"]))
-                            tr["be_moved"] = True; tr["sl"] = trail
-                            last_be_at[sym][tf] = int(time.time())
-                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2, trail))
-                        elif ask <= tr["sl"]:
-                            stats["losses"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
-                    else:
-                        if bid >= tp2:
-                            stats["wins"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
-                        elif ask <= tr["sl"]:
-                            stats["breakevens"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
+                    if bid>=tp2:
+                        stats["wins"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
+                    elif ask<=tr["sl"]:
+                        stats["breakevens"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
+            else:
+                if not tr["be_moved"]:
+                    if ask<=tp1:
+                        trail=entry-(TP1_BE_OFFSET_R*(tr["sl"]-entry)); tr["be_moved"]=True; tr["sl"]=trail
+                        last_be_at[sym][tf]=int(time.time()); await tg_send(session, fmt_manage(sym, tf, direction, entry, tp2, trail))
+                    elif bid>=tr["sl"]:
+                        stats["losses"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
                 else:
-                    if not tr["be_moved"]:
-                        if ask <= tp1:
-                            trail = entry - (TP1_BE_OFFSET_R * (tr["sl"] - entry))
-                            tr["be_moved"] = True; tr["sl"] = trail
-                            last_be_at[sym][tf] = int(time.time())
-                            await tg_send(session, format_manage(sym, tf, direction, entry, tp2, trail))
-                        elif bid >= tr["sl"]:
-                            stats["losses"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "LOSS (SL hit before TP1)", entry, tr["sl"], tp1, tp2))
-                    else:
-                        if ask <= tp2:
-                            stats["wins"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
-                        elif bid >= tr["sl"]:
-                            stats["breakevens"] += 1 if k in current_day_keys else 0
-                            del active_trades[k]
-                            await tg_send(session, format_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
-        await asyncio.gather(*(resolve_one(k) for k in keys))
+                    if ask<=tp2:
+                        stats["wins"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "WIN (TP2 hit)", entry, tr["sl"], tp1, tp2))
+                    elif bid>=tr["sl"]:
+                        stats["breakevens"]+=1 if k in current_day_keys else 0; del active_trades[k]
+                        await tg_send(session, fmt_result(sym, tf, direction, "BREAKEVEN (SL@BE)", entry, tr["sl"], tp1, tp2))
+
+        await asyncio.gather(*(one(k) for k in keys))
         await asyncio.sleep(3)
 
-# ========= DAILY STATS =========
+# ========= DAILY STATS / METRICS =========
 def _reset_daily():
-    stats["unique"] = 0; stats["wins"] = 0; stats["losses"] = 0; stats["breakevens"] = 0
-    current_day_keys.clear()
+    stats["unique"]=stats["wins"]=stats["losses"]=stats["breakevens"]=0; current_day_keys.clear()
 
 async def daily_stats_loop(session):
     while True:
-        sleep_s, target_dt = seconds_until_riyadh(STATS_DAILY_HOUR, 0)
-        await asyncio.sleep(sleep_s)
-        today_2200 = target_dt
-        yesterday_2200 = today_2200 - timedelta(days=1)
-        period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} → {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
-        msg = f"📆 [DAILY STATS]\n{period_str}\n{format_stats_line()}"
-        await tg_send(session, msg)
+        sleep_s, tgt = seconds_until_riyadh(STATS_DAILY_HOUR,0); await asyncio.sleep(sleep_s)
+        y=tgt - timedelta(days=1); period=f"{y.strftime('%Y-%m-%d %H:%M')} â {tgt.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
+        await tg_send(session, f"ð [DAILY STATS]\n{period}\n{leaderboard_line()}")
         _reset_daily()
-        await persist_state()
 
-# ========= METRICS / HEARTBEAT =========
 async def heartbeat_loop():
-    global event_loop_lag_ms, _last_heartbeat_monotonic
-    loop = asyncio.get_running_loop()
-    interval = 1.0
-    _last_heartbeat_monotonic = loop.time()
+    global event_loop_lag_ms
+    loop=asyncio.get_running_loop(); prev=loop.time()
     while True:
-        await asyncio.sleep(interval)
-        nowt = loop.time()
-        expected = _last_heartbeat_monotonic + interval
-        event_loop_lag_ms = max(0.0, (nowt - expected) * 1000.0)
-        _last_heartbeat_monotonic = nowt
+        await asyncio.sleep(1.0)
+        nowt=loop.time(); event_loop_lag_ms=max(0.0,(nowt-(prev+1.0))*1000.0); prev=nowt
 
 async def metrics_handler(_):
-    body = {
+    return web.json_response({
         "ok": True,
-        "event_loop_lag_ms": round(event_loop_lag_ms, 2),
-        "used_weight_1m": rate_used_weight_1m,
-        "retry_after_ms": rate_retry_after_ms,
-        "errors": dict(error_counters),
-        "macro_block_until": macro_block_until,
         "alert_counts": alert_counts,
         "drop_counters": dict(drop_counters),
+        "stats": stats,
+        "event_loop_lag_ms": round(event_loop_lag_ms,2),
+        "macro_block_until": macro_block_until,
         "now_ms": now_ms(),
-        "data_source": DATA_SOURCE,
-    }
-    return web.json_response(body)
+        "scan_limit": SCAN_LIMIT,
+        "relaxed": True
+    })
 
 async def health(_): return web.Response(text="ok")
 
-# ========= PERSISTENCE =========
-def _serialize_state():
-    micro = {}
-    for s, v in micro_hist.items():
-        micro[s] = {"spread": list(v["spread"])[-60:], "depth":  list(v["depth"] )[-60:]}
-    return {
-        "stats": stats,
-        "active_trades": active_trades,
-        "dedup_seen": list(dedup_seen),
-        "last_alert_at": {s: dict(v) for s,v in last_alert_at.items()},
-        "last_be_at": {s: dict(v) for s,v in last_be_at.items()},
-        "be_override_used_at": {s: dict(v) for s,v in be_override_used_at.items()},
-        "macro_block_until": macro_block_until,
-        "current_day_keys": list(current_day_keys),
-        "symbol_meta": symbol_meta,
-        "micro_hist": micro,
-        "oi_abs_ema": dict(oi_abs_ema),
-        "last_symbols": last_symbols_persisted,
-    }
-
-def _hydrate_state(d):
-    global stats, active_trades, dedup_seen, macro_block_until, symbol_meta, oi_abs_ema, last_symbols_persisted
-    if not d: return
-    stats.update(d.get("stats", {}))
-    active_trades.clear(); active_trades.update(d.get("active_trades", {}))
-    dedup_seen.clear(); dedup_seen.extend(d.get("dedup_seen", []))
-    macro_block_until = d.get("macro_block_until", 0)
-    current_day_keys.clear(); current_day_keys.update(d.get("current_day_keys", []))
-    for s, v in d.get("last_alert_at", {}).items(): last_alert_at[s] = v
-    for s, v in d.get("last_be_at", {}).items():    last_be_at[s] = v
-    for s, v in d.get("be_override_used_at", {}).items(): be_override_used_at[s] = v
-    symbol_meta.update(d.get("symbol_meta", {}))
-    mh = d.get("micro_hist", {})
-    for s, obj in mh.items():
-        micro_hist[s]["spread"].extend(obj.get("spread", []))
-        micro_hist[s]["depth"] .extend(obj.get("depth",  []))
-    oi_abs_ema.update(d.get("oi_abs_ema", {}))
-    last_symbols_persisted = d.get("last_symbols", [])
-
-async def persist_state():
-    try:
-        os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-        tmp = STATE_PATH + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_serialize_state(), f)
-        os.replace(tmp, STATE_PATH)
-    except Exception as e:
-        print("Persist error:", e)
-
-async def periodic_persist_loop():
-    while True:
-        await asyncio.sleep(60)
-        await persist_state()
-
-def load_state():
-    try:
-        if os.path.exists(STATE_PATH):
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            _hydrate_state(data)
-            print("State loaded from", STATE_PATH)
-        else:
-            print("No prior state.")
-    except Exception as e:
-        print("Failed to load state:", e)
-
-# ========= MEXC EXECUTION ADAPTER (minimal; market entry + plan TP/SL, move-stop) =========
-def _mexc_headers():
-    ts = str(int(time.time()*1000))
-    return {
-        "ApiKey": MEXC_API_KEY,
-        "Request-Time": ts,
-        "Content-Type": "application/json",
-        "Signature": ""  # filled per call
-    }
-
-def _mexc_sign(ts: str, body_or_params: str) -> str:
-    msg = f"{MEXC_API_KEY}{ts}{body_or_params or ''}"
-    return hmac.new(MEXC_API_SECRET.encode(), msg.encode(), hashlib.sha256).hexdigest()
-
-async def http_json_post_headers(session, url, payload, headers):
-    return await http_request(session, "POST", url, headers=headers, payload=payload, timeout=10, weight_cost=1)
+# ========= MEXC EXECUTION (minimal) =========
+def _mexc_sign(ts, body_or_params):
+    return hmac.new(MEXC_API_SECRET.encode(), f"{MEXC_API_KEY}{ts}{body_or_params or ''}".encode(), hashlib.sha256).hexdigest()
 
 async def mexc_private_post(session, path, payload):
-    if not (MEXC_API_KEY and MEXC_API_SECRET):
-        raise RuntimeError("MEXC keys missing")
-    ts = str(int(time.time()*1000))
-    body = json.dumps(payload, separators=(',',':'))
-    sig = _mexc_sign(ts, body)
-    headers = {"ApiKey": MEXC_API_KEY, "Request-Time": ts, "Recv-Window": MEXC_RECV_WINDOW, "Signature": sig, "Content-Type":"application/json"}
-    url = f"{MEXC_BASE}{path}"
-    return await http_json_post_headers(session, url, payload, headers)
+    if not (MEXC_API_KEY and MEXC_API_SECRET): raise RuntimeError("MEXC keys missing")
+    ts=str(int(time.time()*1000)); body=json.dumps(payload, separators=(',',':'))
+    headers={"ApiKey":MEXC_API_KEY,"Request-Time":ts,"Recv-Window":MEXC_RECV_WINDOW,"Signature":_mexc_sign(ts,body),"Content-Type":"application/json"}
+    return await http_post(session, f"{MEXC_BASE}{path}", payload, headers=headers)
 
 async def mexc_set_position_mode(session):
-    try:
-        payload = {"positionMode": MEXC_POSITION_MODE}
-        await mexc_private_post(session, "/api/v1/private/position/change-position-mode", payload)
-    except Exception as e:
-        print("mexc_set_position_mode err:", e)
+    try: await mexc_private_post(session,"/api/v1/private/position/change-position-mode",{"positionMode":MEXC_POSITION_MODE})
+    except Exception as e: print("mexc_set_position_mode err:", e)
 
-async def mexc_set_leverage(session, symbol_u):
-    try:
-        payload = {"symbol": symbol_u, "leverage": MEXC_LEVERAGE, "openType": MEXC_OPEN_TYPE}
-        await mexc_private_post(session, "/api/v1/private/position/change-leverage", payload)
-    except Exception as e:
-        print("mexc_set_leverage err:", e)
+async def mexc_set_leverage(session, sym_u):
+    try: await mexc_private_post(session,"/api/v1/private/position/change-leverage",{"symbol":sym_u,"leverage":MEXC_LEVERAGE,"openType":MEXC_OPEN_TYPE})
+    except Exception as e: print("mexc_set_leverage err:", e)
 
 async def mexc_market_order(session, symbol, direction, entry, sl, tp1, tp2):
-    if not MEXC_LIVE:
-        return {"live": False}
-    symbol_u = to_mexc_symbol(symbol)
-    side = 1 if direction=="Long" else 2   # 1 buy open, 2 sell open
-    cs = symbol_meta.get(symbol,{}).get("contractSize", 1.0)
-    risk_per_contract = abs(entry - sl) * cs
-    qty = max(1.0, math.floor(MEXC_RISK_USDT / max(1e-9, risk_per_contract)))
-    payload = {
-        "symbol": symbol_u, "price": entry, "vol": qty, "side": side,
-        "type": 1,  # 1: market
-        "openType": MEXC_OPEN_TYPE,
-        "positionId": 0,
-        "leverage": MEXC_LEVERAGE,
-        "externalOid": f"sig-{int(time.time())}"
-    }
+    if not MEXC_LIVE: return {"live": False}
+    sym_u=to_mexc(symbol); side=1 if direction=="Long" else 2
+    cs=symbol_meta.get(symbol,{}).get("contractSize",1.0)
+    qty=max(1.0, math.floor(MEXC_RISK_USDT / max(1e-9, abs(entry-sl)*cs)))
+    payload={"symbol":sym_u,"price":entry,"vol":qty,"side":side,"type":1,"openType":MEXC_OPEN_TYPE,"positionId":0,"leverage":MEXC_LEVERAGE,"externalOid":f"sig-{int(time.time())}"}
     try:
-        r = await mexc_private_post(session, "/api/v1/private/order/submit", payload)
+        r=await mexc_private_post(session,"/api/v1/private/order/submit",payload)
         if r:
-            pid = 0
-            await mexc_private_post(session, "/api/v1/private/planorder/submit", {
-                "symbol": symbol_u, "vol": qty, "side": (3 if direction=="Long" else 4),
-                "openType": MEXC_OPEN_TYPE, "type": 1, "triggerPrice": tp2, "executePrice": tp2, "positionId": pid
-            })
-            await mexc_private_post(session, "/api/v1/private/planorder/submit", {
-                "symbol": symbol_u, "vol": qty, "side": (4 if direction=="Long" else 3),
-                "openType": MEXC_OPEN_TYPE, "type": 2, "triggerPrice": sl, "executePrice": sl, "positionId": pid
-            })
+            await mexc_private_post(session,"/api/v1/private/planorder/submit",{"symbol":sym_u,"vol":qty,"side":(3 if direction=="Long" else 4),"openType":MEXC_OPEN_TYPE,"type":1,"triggerPrice":tp2,"executePrice":tp2,"positionId":0})
+            await mexc_private_post(session,"/api/v1/private/planorder/submit",{"symbol":sym_u,"vol":qty,"side":(4 if direction=="Long" else 3),"openType":MEXC_OPEN_TYPE,"type":2,"triggerPrice":sl,"executePrice":sl,"positionId":0})
         return r
     except Exception as e:
-        print("mexc_market_order err:", e)
-        return None
+        print("mexc_market_order err:", e); return None
 
-# ========= APP MAIN =========
+# ========= APP =========
 async def app_main():
-    load_state()
     async with aiohttp.ClientSession() as session:
-        symbols = await discover_top_usdt_perps(session, SCAN_LIMIT)
-        print("Scanning symbols:", symbols[:10], "... total", len(symbols))
-        global last_symbols_persisted
-        last_symbols_persisted = symbols[:]
-        await persist_state()
+        symbols=await discover(session, SCAN_LIMIT)
+        print("Scanning", len(symbols), "symbols:", symbols[:10], "...")
 
-        await warmup_klines(session, symbols)
-        print("Warmup complete. DATA_SOURCE =", DATA_SOURCE)
+        await warmup(session, symbols)
+        print("Warmup complete.")
 
-        tasks = [
+        # optional: set global position mode (safe even if not live)
+        await mexc_set_position_mode(session)
+
+        tasks=[
             asyncio.create_task(oi_loop(session, symbols)),
             asyncio.create_task(macro_guard_loop(session)),
             asyncio.create_task(scan_loop(session, symbols, "15m")),
             asyncio.create_task(scan_loop(session, symbols, "30m")),
             asyncio.create_task(scan_loop(session, symbols, "1h")),
-            asyncio.create_task(result_resolver_loop(session)),
+            asyncio.create_task(result_resolver(session)),
             asyncio.create_task(daily_stats_loop(session)),
-            asyncio.create_task(periodic_persist_loop()),
             asyncio.create_task(heartbeat_loop()),
         ]
 
-        app = web.Application()
-        app.router.add_get("/", health)
-        app.router.add_get("/metrics", metrics_handler)
-        runner = web.AppRunner(app); await runner.setup()
-        site = web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT","8080"))); await site.start()
-        print("HTTP health/metrics server started.")
+        app=web.Application()
+        app.router.add_get("/", health); app.router.add_get("/metrics", metrics_handler)
+        runner=web.AppRunner(app); await runner.setup()
+        site=web.TCPSite(runner, "0.0.0.0", PORT); await site.start()
+        print("HTTP up on", PORT)
 
-        stop_event = asyncio.Event()
+        stop_event=asyncio.Event()
         def _exit(*_): stop_event.set()
         for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                asyncio.get_running_loop().add_signal_handler(sig, _exit)
-            except NotImplementedError:
-                pass
+            try: asyncio.get_running_loop().add_signal_handler(sig, _exit)
+            except NotImplementedError: pass
 
         await stop_event.wait()
-        for t in tasks:
-            t.cancel()
+        for t in tasks: t.cancel()
         for t in tasks:
             try: await t
             except asyncio.CancelledError: pass
             except Exception: pass
-        await persist_state()
         try: await site.stop()
-        except Exception: pass
+        except: pass
         try: await runner.cleanup()
-        except Exception: pass
+        except: pass
 
-if __name__ == "__main__":
+if __name__=="__main__":
     try:
         import uvloop; uvloop.install()
-    except Exception:
-        pass
+    except Exception: pass
     asyncio.run(app_main())

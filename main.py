@@ -135,7 +135,7 @@ STATE_PATH = os.getenv("STATE_PATH", "/data/state.json")
 TELEGRAM_MAX_LEN = 3800
 
 # ========= CONSTANTS =========
-MEXC_BASE = "https://contract.mexc.com"
+MEXC_BASE = os.getenv("MEXC_BASE", "https://contract.mexc.com")
 RIYADH_TZ = timezone(timedelta(hours=3))
 TIMEFRAMES = ["15m","30m","1h"]
 TF_TO_INTERVAL = {"15m":"Min15","30m":"Min30","1h":"Min60"}

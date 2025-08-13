@@ -1,6 +1,7 @@
-# app.py — ALL Binance USDT-M PERPS auto-scan edition
-# (single-file async bot: aiohttp+uvloop, /healthz, Telegram alerts)
-# See ENV knobs at the top of Settings below.
+# app.py — ALL Binance USDT-M PERPS auto-scan
+# R:R = 1:2, two targets (TP1, TP2), trailing stop ONLY after TP1
+# Extra (not strict) volume filter: vol >= VOL_SMA_RATIO_MIN * SMA20
+# Async: aiohttp + uvloop, /healthz, Telegram alerts, 6h cooldown, results tracking.
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -13,13 +14,12 @@ def _ensure(pkgs):
     if miss:
         print("Installing:", miss, flush=True)
         subprocess.check_call([sys.executable,"-m","pip","install","--upgrade",*miss])
-
 _ensure([
     "aiohttp>=3.9.5", "uvloop>=0.19.0", "pydantic>=2.7.0",
     "pydantic-settings>=2.2.1", "structlog>=24.1.0", "tzdata>=2024.1", "orjson>=3.10.7",
 ])
 
-import asyncio, aiohttp, orjson, time
+import asyncio, aiohttp, orjson, time, math
 from typing import List, Dict, Any, Optional, Deque, Tuple
 from collections import deque
 from datetime import datetime, timedelta, timezone
@@ -31,16 +31,14 @@ from pydantic import field_validator
 
 # ---------------- Settings ----------------
 class Settings(BaseSettings):
-    # Core scan config
-    SYMBOLS: str | List[str] = "ALL"   # "ALL" = auto-discover all USDT-M perps; or "BTCUSDT,ETHUSDT"
+    # Core scan
+    SYMBOLS: str | List[str] = "ALL"   # "ALL" or CSV like "BTCUSDT,ETHUSDT"
     TIMEFRAMES: List[str] = ["5m","15m"]
+    MAX_SYMBOLS: int = 200
+    WS_CHUNK_SIZE: int = 80
+    BACKFILL_LIMIT: int = 60          # >= ATR_LEN+1
 
-    # Safety/perf knobs for ALL mode
-    MAX_SYMBOLS: int = 200            # upper cap in ALL mode
-    WS_CHUNK_SIZE: int = 80           # symbols per WS connection (Binance allows multiplexing; chunk sensibly)
-    BACKFILL_LIMIT: int = 50          # small REST backfill per TF to warm indicators
-
-    # Confirmations & filters (same as before)
+    # Confirmations & filters
     BREAKOUT_PAD_BP: int = 10
     BODY_RATIO_MIN: float = 0.60
     RETEST_BARS: int = 2
@@ -52,37 +50,45 @@ class Settings(BaseSettings):
     TOB_IMB_MIN: float = 0.15
     TOB_STABILITY_CHECKS: int = 1
     VOL_Z_MIN: float = 1.5
-    FUNDING_MAX: float = 0.01
-    OI_Z_MIN: float = 1.0
-    BETA_MAX_DIVERGENCE: float = 0.7
     SPREAD_MAX_BP: int = 5
-    ATR_PAUSE_MULT: float = 2.0
 
-    MAX_RISK_PCT: float = 0.5
-    DD_HALT_PCT: float = 3.0
-    COOLDOWN_SEC: int = 900
-    MIN_CONF_BASE: int = 3
+    # NEW: Extra (not strict) volume filter
+    VOL_SMA_LEN: int = 20
+    VOL_SMA_RATIO_MIN: float = 1.10   # latest vol must be >= 1.1 × SMA20
+
+    # Entry/Exit & Risk (R:R = 1:2)
+    ATR_LEN: int = 14
+    ATR_SL_MULT: float = 1.5          # SL distance = ATR * this (used to place SL only)
+    ENTRY_MODE: str = "MARKET"        # "MARKET" | "RETEST"
+    MAX_RISK_PCT: float = 1.0
+    ACCOUNT_EQUITY_USDT: Optional[float] = None
     SLIPPAGE_BP: int = 3
     DRY_RUN: bool = True
+
+    # Trailing stop (ONLY after TP1)
+    TRAIL_ATR_MULT: float = 1.0       # trail distance = ATR * this (uses ATR at entry candle)
+
+    # Ops
+    COOLDOWN_SEC: int = 21600         # 6 hours cooldown per symbol
     LOG_LEVEL: str = "INFO"
     DATA_DIR: str = "./data"
 
+    # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
+    # Server
     HOST: str = "0.0.0.0"
     PORT: int = int(os.getenv("PORT", "8080"))
     TZ: str = "Asia/Riyadh"
 
     model_config = SettingsConfigDict(env_file=".env", case_sensitive=False)
-
     @field_validator("SYMBOLS", mode="before")
     @classmethod
     def _split_symbols(cls, v):
         if isinstance(v, str) and v.strip().upper() != "ALL":
             return [s.strip().upper() for s in v.split(",") if s.strip()]
         return v
-
     @field_validator("TIMEFRAMES", mode="before")
     @classmethod
     def _split_tfs(cls, v):
@@ -117,18 +123,23 @@ def body_ratio(o,h,l,c): rng=max(h-l,1e-12); return abs(c-o)/rng
 def sma(vals: List[float], n:int)->Optional[float]:
     if n<=0 or len(vals)<n: return None
     return sum(vals[-n:])/n
+def atr(highs: List[float], lows: List[float], closes: List[float], length: int) -> Optional[float]:
+    if len(closes) < length + 1: return None
+    trs=[]
+    for i in range(1,len(closes)):
+        trs.append(max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1])))
+    if len(trs) < length: return None
+    return sum(trs[-length:]) / length
 
 # --------------- Data ----------------
 class Candle:
     __slots__=("open_time","open","high","low","close","volume","close_time")
     def __init__(self, ot,o,h,l,c,v,ct):
         self.open_time=ot; self.open=o; self.high=h; self.low=l; self.close=c; self.volume=v; self.close_time=ct
-
 class BookTop:
     __slots__=("bid_price","bid_qty","ask_price","ask_qty")
     def __init__(self, bp,bq,ap,aq):
         self.bid_price=bp; self.bid_qty=bq; self.ask_price=ap; self.ask_qty=aq
-
 class Signal:
     def __init__(self, **kw): self.__dict__.update(kw)
 
@@ -137,7 +148,6 @@ BASE_REST = "https://fapi.binance.com"
 BASE_WS = "wss://fstream.binance.com/stream"
 
 async def discover_perp_usdt_symbols(session: aiohttp.ClientSession, max_symbols:int) -> List[str]:
-    """USDT-M exchangeInfo → PERPETUAL + quote=USDT + TRADING"""
     url = f"{BASE_REST}/fapi/v1/exchangeInfo"
     async with session.get(url) as r:
         r.raise_for_status()
@@ -150,8 +160,7 @@ async def discover_perp_usdt_symbols(session: aiohttp.ClientSession, max_symbols
         except Exception:
             continue
     out = sorted(out)
-    if max_symbols>0:
-        out = out[:max_symbols]
+    if max_symbols>0: out = out[:max_symbols]
     return out
 
 class BinanceClient:
@@ -204,14 +213,11 @@ class WSStream:
                         break
 
 class WSStreamMulti:
-    """Run multiple WS connections (chunked symbol lists) concurrently."""
     def __init__(self, all_symbols: List[str], timeframes: List[str], on_kline, on_bookticker, chunk_size:int):
         self.chunks=[all_symbols[i:i+chunk_size] for i in range(0,len(all_symbols),chunk_size)]
         self.timeframes=timeframes; self.on_kline=on_kline; self.on_bookticker=on_bookticker
     async def run(self):
-        tasks=[]
-        for chunk in self.chunks:
-            tasks.append(asyncio.create_task(WSStream(chunk,self.timeframes,self.on_kline,self.on_bookticker).run()))
+        tasks=[asyncio.create_task(WSStream(c,self.timeframes,self.on_kline,self.on_bookticker).run()) for c in self.chunks]
         await asyncio.gather(*tasks)
 
 # ------------- OB & Breakout -------------
@@ -278,7 +284,7 @@ class BreakoutEngine:
         return None
     def on_closed_bar(self, sym, tf)->Optional[Signal]:
         b=self._buf(sym,tf); o,h,l,c,v=list(b["o"]),list(b["h"]),list(b["l"]),list(b["c"]),list(b["v"])
-        if len(c)<25: return None
+        if len(c)<max(25, S.ATR_LEN+1): return None
         ph,pl=self._prior_high_low(h,l,20)
         if ph is None: return None
         pad=self.s.BREAKOUT_PAD_BP/10_000; br=body_ratio(o[-1],h[-1],l[-1],c[-1])
@@ -289,9 +295,11 @@ class BreakoutEngine:
         if not side: return None
         sr=self._sweep_reclaim(h,l,c,side)
         self._ret(sym,tf).append(RetestState(level,side,self.s.RETEST_BARS,self.s.RETEST_MAX_BP))
+        atr_val = atr(list(h), list(l), list(c), S.ATR_LEN)
         return Signal(symbol=sym, tf=tf, side=side, price=c[-1], level=level, body_ratio=br,
                       pad_bp=self.s.BREAKOUT_PAD_BP, retest_ok=False, sweep_reclaim=sr,
-                      htf_bias_ok=True, tob_imbalance=0.0, vol_z=0.0, spread_bp=None)
+                      htf_bias_ok=True, tob_imbalance=0.0, vol_z=0.0, spread_bp=None,
+                      atr_val=atr_val)
 
 # ------------- Telegram & Health -------------
 class Telegram:
@@ -310,17 +318,36 @@ class HealthServer:
         self.app.add_routes([web.get("/healthz", self.health)])
         self.host=host; self.port=port
     async def health(self, req): 
-        return web.json_response({"ok":True,"uptime_sec":int(time.time()-self.state.get("start_time",time.time())),
-                                  "last_kline":self.state.get("last_kline",{}),"last_alert":self.state.get("last_alert",{}),
-                                  "symbols":self.state.get("symbols",[]),"timeframes":self.state.get("timeframes",[])})
+        return web.json_response({
+            "ok":True,
+            "uptime_sec":int(time.time()-self.state.get("start_time",time.time())),
+            "last_kline":self.state.get("last_kline",{}),
+            "last_alert":self.state.get("last_alert",{}),
+            "symbols":self.state.get("symbols",[]),
+            "timeframes":self.state.get("timeframes",[]),
+            "open_trades": list(OPEN_TRADES.keys()),
+        })
     def run(self): web.run_app(self.app, host=self.host, port=self.port)
 
-# ------------- App wiring -------------
+# ------------- Risk helpers -------------
+def _fmt_pct(a: float, b: float) -> float:
+    if b == 0: return 0.0
+    return (a/b - 1.0) * 100.0
+
+# ------------- App state (cooldown & trades) -------------
 STATE={"start_time":int(time.time()),"last_kline":{},"last_alert":{},"symbols":[], "timeframes":S.TIMEFRAMES}
 OB=OrderBookTracker()
 BE=BreakoutEngine(S)
 
-async def small_backfill(client:BinanceClient, sym:str, tf:str):
+LAST_SIGNAL_TS: Dict[str, int] = {}      # 6h cooldown per symbol
+OPEN_TRADES: Dict[str, Dict[str, Any]] = {}  # symbol -> trade dict
+
+def _log_event(obj: Dict[str, Any]):
+    os.makedirs(S.DATA_DIR, exist_ok=True)
+    path=os.path.join(S.DATA_DIR,"events.jsonl")
+    with open(path,"ab") as f: f.write(orjson.dumps(obj)+b"\n")
+
+async def small_backfill(client:"BinanceClient", sym:str, tf:str):
     try:
         data=await client.klines(sym, tf, limit=S.BACKFILL_LIMIT)
         for k in data[:-1]:
@@ -328,10 +355,10 @@ async def small_backfill(client:BinanceClient, sym:str, tf:str):
     except Exception as e:
         log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
 
-async def periodic_derivs(client:BinanceClient, symbols:List[str]):
+async def periodic_derivs(client:"BinanceClient", symbols:List[str]):
     while True:
         try:
-            for sym in symbols[:50]:  # sample subset to reduce load
+            for sym in symbols[:50]:
                 fr=await client.funding_rate(sym)
                 oi=await client.open_interest_z(sym,"5m")
                 log.info("derivs", symbol=sym, funding=fr, oi_z=oi)
@@ -339,18 +366,16 @@ async def periodic_derivs(client:BinanceClient, symbols:List[str]):
             log.warning("derivs_poll_err", error=str(e))
         await asyncio.sleep(60)
 
-def _log_event(symbol:str, text:str):
-    os.makedirs(S.DATA_DIR, exist_ok=True)
-    path=os.path.join(S.DATA_DIR,"events.jsonl")
-    with open(path,"ab") as f: f.write(orjson.dumps({"ts":int(time.time()),"symbol":symbol,"text":text})+b"\n")
-
+# ----------- Signal handling -----------
 async def on_kline(symbol:str, k:dict):
     sym=symbol.upper(); tf=k["i"]
     cndl=Candle(int(k["t"]), float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["q"]), int(k["T"]))
     BE.add_candle(sym, tf, cndl)
     STATE["last_kline"]={"symbol":sym,"tf":tf,"t":k["T"]}
     sig=BE.on_closed_bar(sym, tf)
-    if not sig: return
+    if not sig:
+        return
+
     # HTF SMA gate for 5m using 15m buffer
     if tf=="5m":
         buf=BE.buffers.get((sym,"15m"))
@@ -359,70 +384,220 @@ async def on_kline(symbol:str, k:dict):
             sig.htf_bias_ok = not ((sig.side=="LONG" and sig.price<=htf) or (sig.side=="SHORT" and sig.price>=htf))
         else:
             sig.htf_bias_ok=True
+
     # TOB & spread
     top=OB.top(sym)
     if top:
         imb=(top.bid_qty-top.ask_qty)/max(top.bid_qty+top.ask_qty,1e-9)
         sig.tob_imbalance=imb
         mid=(top.ask_price+top.bid_price)/2
-        sig.spread_bp=percent_bp(top.ask_price-top.bid_price, mid)
-    # Vol z (30)
+        mid = mid if mid > 0 else max(top.ask_price, top.bid_price)
+        sig.spread_bp=percent_bp(max(top.ask_price-top.bid_price,0.0), mid)
+
+    # Volume filters
     buf=BE.buffers.get((sym,tf))
-    if buf and len(buf["v"])>=30:
-        vols=list(buf["v"]); win=vols[-30:-1]
+    if buf and len(buf["v"])>=max(30, S.VOL_SMA_LEN+1):
+        vols=list(buf["v"])
+        # Z-score filter (existing)
+        win=vols[-30:-1]
         if win:
             mean=sum(win)/len(win); var=sum((x-mean)**2 for x in win)/len(win); std=var**0.5 if var>0 else 1.0
             sig.vol_z=(vols[-1]-mean)/std
+        # NEW: SMA20 volume ratio (not strict)
+        sma20 = sma(vols, S.VOL_SMA_LEN) or 0.0
+        vol_ratio = (vols[-1] / sma20) if sma20 > 0 else 0.0
+    else:
+        sig.vol_z = sig.vol_z if hasattr(sig, "vol_z") else 0.0
+        vol_ratio = 0.0
+
     # Filters
     if not getattr(sig,"htf_bias_ok",True): return
     if abs(getattr(sig,"tob_imbalance",0.0))<S.TOB_IMB_MIN: return
     if (sig.spread_bp or 0)>S.SPREAD_MAX_BP: return
     if getattr(sig,"vol_z",0.0)<S.VOL_Z_MIN: return
+    if vol_ratio < S.VOL_SMA_RATIO_MIN: return   # not strict extra volume filter
+
+    # 6h cooldown per symbol or skip if already open
+    now_ts = int(time.time())
+    last_ts = LAST_SIGNAL_TS.get(sym, 0)
+    if now_ts - last_ts < S.COOLDOWN_SEC:
+        return
+    if sym in OPEN_TRADES:
+        return
+
+    # Compute Entry/SL using ATR SL and R-based targets (1R and 2R)
+    if not sig.atr_val or sig.atr_val <= 0:
+        sig.atr_val = sig.price * 0.003  # fallback
+    pad = S.BREAKOUT_PAD_BP / 10_000
+    if S.ENTRY_MODE.upper() == "RETEST":
+        entry = sig.level * (1 + pad) if sig.side == "LONG" else sig.level * (1 - pad)
+        entry_note = "retest"
+    else:
+        entry = sig.price
+        entry_note = "market"
+
+    # SL via ATR multiplier
+    if sig.side == "LONG":
+        sl = entry - sig.atr_val * S.ATR_SL_MULT
+    else:
+        sl = entry + sig.atr_val * S.ATR_SL_MULT
+
+    risk = abs(entry - sl)
+    if risk <= 0:
+        return
+
+    # Targets at 1R and 2R for exact R:R=1:2
+    if sig.side == "LONG":
+        tp1 = entry + risk * 1.0
+        tp2 = entry + risk * 2.0
+    else:
+        tp1 = entry - risk * 1.0
+        tp2 = entry - risk * 2.0
+
+    # Position size (optional)
+    qty_txt = "—"
+    if S.ACCOUNT_EQUITY_USDT and S.ACCOUNT_EQUITY_USDT > 0:
+        qty = (S.ACCOUNT_EQUITY_USDT * (S.MAX_RISK_PCT / 100.0)) / risk
+        qty_txt = f"{qty:.4f}"
+
+    # Save open trade (trail only AFTER TP1)
+    OPEN_TRADES[sym] = {
+        "symbol": sym, "side": sig.side, "tf": tf,
+        "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+        "opened_ts": now_ts,
+        "tp1_hit": False,
+        "trail_active": False,
+        "trail_peak": None,     # highest (long) / lowest (short) since TP1
+        "trail_dist": sig.atr_val * S.TRAIL_ATR_MULT,  # fixed ATR distance for trailing
+        "atr_at_entry": sig.atr_val,
+    }
+    LAST_SIGNAL_TS[sym] = now_ts
+
     # Alert
     direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
     tz_dt=to_tz(now_utc(), S.TZ)
+    sl_pct = _fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
     text=(f"{direction} <b>{sym}</b> <code>{tf}</code>\n"
-          f"Price: <b>{sig.price:.4f}</b>  Level: {sig.level:.4f}  Body: {sig.body_ratio:.2f}\n"
-          f"TOB: {sig.tob_imbalance:.2f}  VolZ: {getattr(sig,'vol_z',0):.2f}  Spread(bp): {sig.spread_bp or 0:.1f}\n"
+          f"Price: <b>{sig.price:.6f}</b>  Level: {sig.level:.6f}  Body: {sig.body_ratio:.2f}\n"
+          f"TOB: {sig.tob_imbalance:.2f}  VolZ: {getattr(sig,'vol_z',0):.2f}  Vol/SMA{S.VOL_SMA_LEN}: {vol_ratio:.2f}  Spread(bp): {sig.spread_bp or 0:.1f}\n"
           f"HTF bias: {'✅' if sig.htf_bias_ok else '❌'}  Sweep/Reclaim: {'✅' if sig.sweep_reclaim else '—'}\n"
-          f"Time: {tz_dt.isoformat()}")
+          f"Time: {tz_dt.isoformat()}\n"
+          f"\n<b>Plan</b> ({entry_note}, R:R = 1:2):\n"
+          f"Entry: <b>{entry:.6f}</b>\n"
+          f"SL: <b>{sl:.6f}</b>  ({sl_pct:+.2f}%)\n"
+          f"TP1: <b>{tp1:.6f}</b>  ({tp1_pct:+.2f}%)\n"
+          f"TP2: <b>{tp2:.6f}</b>  ({tp2_pct:+.2f}%)\n"
+          f"Trailing: starts after TP1 (ATR×{S.TRAIL_ATR_MULT:.2f})\n"
+          f"Risk%: {S.MAX_RISK_PCT:.2f}%   Qty: {qty_txt}")
     await alert(text, sym)
+    _log_event({"ts": now_ts, "type": "signal", "symbol": sym, "side": sig.side, "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2})
 
+# ----------- Trade management via bookTicker -----------
 async def on_bookticker(symbol:str, data:dict):
     OB.update_book_ticker(symbol, data)
+    sym = symbol.upper()
+    trade = OPEN_TRADES.get(sym)
+    if not trade:
+        return
+    top = OB.top(sym)
+    if not top:
+        return
+    mid = (top.ask_price + top.bid_price) / 2
+    if mid <= 0:
+        return
 
+    side = trade["side"]
+    entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
+    trail_dist = trade["trail_dist"]
+
+    # Step 1: before TP1, respect hard SL and TP1
+    if not trade["tp1_hit"]:
+        if side == "LONG":
+            if mid <= sl:
+                await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid >= tp1:
+                trade["tp1_hit"] = True
+                trade["trail_active"] = True
+                trade["trail_peak"] = mid
+        else:
+            if mid >= sl:
+                await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid <= tp1:
+                trade["tp1_hit"] = True
+                trade["trail_active"] = True
+                trade["trail_peak"] = mid
+        # if TP1 not yet hit, nothing else to do
+        return
+
+    # Step 2: after TP1, enable trailing stop; still allow final TP2 take profit
+    if side == "LONG":
+        # update peak
+        if trade["trail_active"]:
+            trade["trail_peak"] = max(trade["trail_peak"], mid)
+            trail_stop = trade["trail_peak"] - trail_dist
+            # if price falls to trailing stop → close
+            if mid <= trail_stop:
+                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry); return
+        # TP2 exit
+        if mid >= tp2:
+            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry); return
+    else:
+        if trade["trail_active"]:
+            trade["trail_peak"] = min(trade["trail_peak"], mid) if trade["trail_peak"] is not None else mid
+            trail_stop = trade["trail_peak"] + trail_dist
+            if mid >= trail_stop:
+                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry); return
+        if mid <= tp2:
+            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry); return
+
+async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: float):
+    trade = OPEN_TRADES.pop(symbol, None)
+    if not trade:
+        return
+    pl_pct = _fmt_pct(exit_price, entry)
+    dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
+    msg = (f"📌 <b>RESULT</b> {symbol}\n"
+           f"Outcome: <b>{outcome}</b>\n"
+           f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}%)\n"
+           f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
+           f"Duration: {dur_min:.1f} min  |  Trail ATR: {trade.get('atr_at_entry'):.6f} × {S.TRAIL_ATR_MULT:.2f}")
+    await alert(msg, symbol)
+    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "tp1_hit": trade.get("tp1_hit")})
+
+# ------------- Alert + Main -------------
 async def alert(text:str, symbol:str):
     if not S.TELEGRAM_BOT_TOKEN or not S.TELEGRAM_CHAT_ID:
         log.info("alert", text=text); return
     tg=Telegram(S.TELEGRAM_BOT_TOKEN, S.TELEGRAM_CHAT_ID)
     await tg.send(text)
     STATE["last_alert"]={"symbol":symbol,"text":text,"ts":int(time.time())}
-    _log_event(symbol, text)
 
 async def main():
-    log.info("boot", tfs=S.TIMEFRAMES)
+    log.info("boot", tfs=S.TIMEFRAMES, cooldown_sec=S.COOLDOWN_SEC, rr="1:2", trailing_after_tp1=True)
     # Health server
     hs=HealthServer(S.HOST, S.PORT, STATE)
     asyncio.create_task(asyncio.to_thread(hs.run))
     async with aiohttp.ClientSession() as sess:
-        client=BinanceClient(sess)
+        from_types = (list, tuple)
         # Discover symbols if ALL
         if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
             symbols=await discover_perp_usdt_symbols(sess, S.MAX_SYMBOLS)
-        elif isinstance(S.SYMBOLS, list):
-            symbols=S.SYMBOLS
+        elif isinstance(S.SYMBOLS, from_types):
+            symbols=list(S.SYMBOLS)
         else:
             symbols=[str(S.SYMBOLS)]
         STATE["symbols"]=symbols
         log.info("symbols_selected", count=len(symbols))
-        # Small backfill (throttled)
-        for sym in symbols:
+        # Backfill
+        from_types = (list, tuple)
+        client=BinanceClient(sess)
+        for i, sym in enumerate(symbols):
             for tf in S.TIMEFRAMES:
                 await small_backfill(client, sym, tf)
-            await asyncio.sleep(0.02)  # minor spacing to be polite
-        # Derivatives poll (sample subset)
+            if i % 10 == 0:
+                await asyncio.sleep(0.2)
         asyncio.create_task(periodic_derivs(client, symbols))
-    # WS streams in chunks
+    # WS streams chunked
     ws_multi=WSStreamMulti(STATE["symbols"], S.TIMEFRAMES, on_kline, on_bookticker, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 

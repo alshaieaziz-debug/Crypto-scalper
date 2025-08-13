@@ -1,15 +1,15 @@
-
-import os, asyncio, time, math
+import os, asyncio, time
 from collections import deque, defaultdict
 import aiohttp
 from aiohttp import web
+from datetime import datetime, timezone, timedelta
 
 # ========= ENV CONFIG =========
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Tunables
-SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))      # try 120–150 first; then 175–200 if stable
+# Tunables (core)
+SCAN_LIMIT            = int(os.getenv("SCAN_LIMIT", "130"))      # start 120–150; bump if stable
 MIN_CONF              = int(os.getenv("MIN_CONF", "8"))          # min confidence to alert
 BREAKOUT_PAD_BPS      = float(os.getenv("BREAKOUT_PAD_BPS", "5"))      # 0.05% pad
 VOL_SURGE_MIN         = float(os.getenv("VOL_SURGE_MIN", "1.25"))      # >=25% above 20-c avg
@@ -22,8 +22,20 @@ MACRO_COOLDOWN_SEC    = int(os.getenv("MACRO_COOLDOWN_SEC", "600"))    # 10 min 
 NEWS_PAUSE            = os.getenv("NEWS_PAUSE","false").lower() == "true"
 COINGLASS_API_KEY     = os.getenv("COINGLASS_API_KEY","")              # optional
 
-# ========= ENDPOINTS (Binance USDⓈ-M) =========
+# A-tier extras (env-controlled)
+HARD_REQUIRE_OI   = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
+CORR_HARD_BLOCK   = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
+COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC","180"))     # per pair/tf alert cooldown
+MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.008")) # 0.8% max stop distance
+
+# Stats & reporting
+DEDUP_MIN          = int(os.getenv("DEDUP_MIN", "5"))         # within N minutes treat same idea as duplicate (stats only)
+WIN_TIMEOUT_MIN    = int(os.getenv("WIN_TIMEOUT_MIN", "90"))  # stop monitoring a trade after N minutes if neither TP/SL hits
+STATS_DAILY_HOUR   = int(os.getenv("STATS_DAILY_HOUR", "22")) # 22:00 Riyadh (UTC+3)
+
+# ========= CONSTANTS =========
 BINANCE_BASE = "https://fapi.binance.com"
+RIYADH_TZ = timezone(timedelta(hours=3))  # no DST
 
 # ========= STATE =========
 kbuf = defaultdict(lambda: {
@@ -35,6 +47,16 @@ oi_hist = defaultdict(lambda: deque(maxlen=10))  # symbol -> [(ts_ms, oi_float)]
 last_alert_at = defaultdict(lambda: {'1m':0,'5m':0,'15m':0})
 macro_block_until = 0
 TIMEFRAMES = ["1m","5m","15m"]
+
+# Stats structures
+stats = {"unique": 0, "wins": 0, "losses": 0}
+dedup_seen = deque(maxlen=2000)   # (key, ts_ms)
+active_trades = {}               # trade_id -> dict(entry, sl, tp1, direction, symbol, tf, start_ms)
+current_day_keys = set()         # trade keys created since last daily digest
+
+def trade_key(sym, tf, direction, entry):
+    # round entry to 5 dp to collapse near-duplicates
+    return f"{sym}|{tf}|{direction}|{round(entry,5)}"
 
 # ========= HELPERS =========
 def now_ms(): return int(time.time()*1000)
@@ -50,18 +72,24 @@ async def http_json(session, url, params=None, headers=None, timeout=10):
             await asyncio.sleep(0.25*(attempt+1))
     return None
 
+async def http_json_post(session, url, payload=None, timeout=8):
+    try:
+        async with session.post(url, json=payload, timeout=timeout) as r:
+            if r.status == 200:
+                return await r.json(content_type=None)
+            return None
+    except Exception:
+        return None
+
 async def tg_send(session, text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Telegram not configured.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"}
-    try:
-        async with session.post(url, json=payload, timeout=8) as r:
-            if r.status != 200:
-                print("Telegram error:", r.status, await r.text())
-    except Exception as e:
-        print("Telegram exception:", e)
+    j = await http_json_post(session, url, payload)
+    if j is None:
+        print("Telegram send failed")
 
 def next_close_ms(tf):
     s = int(time.time())
@@ -79,6 +107,15 @@ def rr_ok(entry, sl, tp_mult=1.5):
     risk = abs(entry - sl)
     return risk > 0 and (tp_mult*risk) / risk >= 1.2
 
+def riyadh_now(): return datetime.now(RIYADH_TZ)
+
+def seconds_until_riyadh(hour=22, minute=0):
+    now = riyadh_now()
+    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= now:
+        target += timedelta(days=1)
+    return (target - now).total_seconds(), target
+
 def format_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score):
     return (
 f"[TRADE ALERT]\n"
@@ -91,6 +128,19 @@ f"Reason: {reason}\n"
 f"Timeframe: {tf}\n"
 f"Confidence Score: {score}/10"
 )
+
+def format_result(pair, tf, direction, result, entry, sl, tp1):
+    return (
+f"[RESULT] {result}\n"
+f"Pair: {pair}  TF: {tf}\n"
+f"Direction: {direction}\n"
+f"Entry: {entry:.6f}  SL: {sl:.6f}  TP1: {tp1:.6f}"
+)
+
+def format_stats_line():
+    total = stats["unique"]; wins = stats["wins"]; losses = stats["losses"]
+    wr = (wins / total * 100.0) if total > 0 else 0.0
+    return f"Unique Alerts: {total} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"
 
 # ========= BINANCE WRAPPERS =========
 async def bn_exchange_info(session):
@@ -111,6 +161,9 @@ async def bn_premium_index(session, symbol):
 
 async def bn_depth(session, symbol, limit=50):
     return await http_json(session, f"{BINANCE_BASE}/fapi/v1/depth", params={"symbol":symbol,"limit":limit})
+
+async def bn_book_ticker(session, symbol):
+    return await http_json(session, f"{BINANCE_BASE}/fapi/v1/ticker/bookTicker", params={"symbol":symbol})
 
 # ========= OPTIONAL: COINGLASS OI =========
 async def cg_open_interest_delta5m(session, symbol, exch="BINANCE"):
@@ -336,6 +389,8 @@ async def scan_loop(session, symbols, tf):
                     oi_pct = cg
                 if oi_pct is None or abs(oi_pct) < OI_DELTA_MIN:
                     oi_soft_fail = True
+                if HARD_REQUIRE_OI and oi_soft_fail:
+                    return
 
                 # --- Spread & depth (must) ---
                 ob = await bn_depth(session, sym, limit=100)
@@ -344,7 +399,7 @@ async def scan_loop(session, symbols, tf):
                 if not ok_depth:
                     return
 
-                # --- RR check (must) ---
+                # --- RR & SL sanity (must) ---
                 buf = kbuf[sym][tf]
                 sl_long, sl_short = swing_levels(buf['lo'], buf['hi'])
                 entry = sig['close']
@@ -354,24 +409,32 @@ async def scan_loop(session, symbols, tf):
                     risk = max(1e-9, entry - sl)
                     tp1, tp2 = entry + 0.75*risk, entry + 1.50*risk
                     reason_prefix = "Breakout + pad" if entry > max(buf['cl']) else "Engulfing reversal + sweep"
+                    risk_pct = (entry - sl)/entry if sl else 999
                 elif sig['direction']=="Short" and sl_short is not None:
                     if not rr_ok(entry, sl_short): return
                     sl = sl_short
                     risk = max(1e-9, sl - entry)
                     tp1, tp2 = entry - 0.75*risk, entry - 1.50*risk
                     reason_prefix = "Breakdown + pad" if entry < min(buf['cl']) else "Engulfing reversal + sweep"
+                    risk_pct = (sl - entry)/entry if sl else 999
                 else:
                     return
 
-                # --- Correlation (soft) ---
-                corr_soft, btc5m, eth5m = await correlation_soft_flag(session, sig['direction'])
+                # Oversized stop filter
+                if risk_pct <= 0 or risk_pct > MAX_RISK_PCT:
+                    return
 
-                # --- Session vol (soft) ---
-                sess_soft = session_soft_flag(tf, list(buf['cl']))
+                # --- Correlation (soft / hard block option) ---
+                corr_soft, btc5m, eth5m = await correlation_soft_flag(session, sig['direction'])
+                if CORR_HARD_BLOCK:
+                    if sig['direction']=="Long" and (btc5m < -0.007 or eth5m < -0.007):
+                        return
+                    if sig['direction']=="Short" and (btc5m >  0.007 or eth5m >  0.007):
+                        return
 
                 # --- Debounce per symbol/tf ---
                 now_s = int(time.time())
-                if now_s - last_alert_at[sym][tf] < 60: return
+                if now_s - last_alert_at[sym][tf] < COOLDOWN_SEC: return
                 last_alert_at[sym][tf] = now_s
 
                 # --- Score ---
@@ -385,6 +448,8 @@ async def scan_loop(session, symbols, tf):
                     score -= 1; info_bits.append(f"Corr soft: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
                 else:
                     score += 1
+                # session softness
+                sess_soft = session_soft_flag(tf, list(buf['cl']))
                 if sess_soft:
                     score -= 1; info_bits.append("Session soft")
                 else:
@@ -397,6 +462,28 @@ async def scan_loop(session, symbols, tf):
                 if final_score < MIN_CONF:
                     return
 
+                # Duplicate exclusion for stats (still send alert, but don't count duplicates)
+                key = trade_key(sym, tf, sig['direction'], entry)
+                nowm = now_ms()
+                is_unique = True
+                # prune old dedup keys
+                while dedup_seen and nowm - dedup_seen[0][1] > DEDUP_MIN*60*1000:
+                    dedup_seen.pop(0)
+                for k, ts in dedup_seen:
+                    if k == key:
+                        is_unique = False
+                        break
+                if is_unique:
+                    dedup_seen.append((key, nowm))
+                    stats["unique"] += 1
+                    current_day_keys.add(key)  # track for today's digest
+                    # register active trade for resolution
+                    active_trades[key] = {
+                        "symbol": sym, "tf": tf, "direction": sig['direction'],
+                        "entry": entry, "sl": sl, "tp1": tp1, "start_ms": nowm
+                    }
+
+                # queue alert
                 alerts.append(
                     format_alert(sym, sig['direction'], entry, sl, tp1, tp2, reason, tf, final_score)
                 )
@@ -404,6 +491,85 @@ async def scan_loop(session, symbols, tf):
         await asyncio.gather(*(process(s) for s in symbols))
         for a in alerts:
             await tg_send(session, a)
+
+# ========= RESULT RESOLVER (TP1 vs SL) =========
+async def result_resolver_loop(session):
+    # checks active_trades periodically and updates stats when TP/SL is hit
+    while True:
+        if not active_trades:
+            await asyncio.sleep(5)
+            continue
+        keys = list(active_trades.keys())
+        sem = asyncio.Semaphore(8)
+        async def resolve_one(k):
+            async with sem:
+                tr = active_trades.get(k)
+                if not tr: return
+                sym, direction = tr["symbol"], tr["direction"]
+                entry, sl, tp1 = tr["entry"], tr["sl"], tr["tp1"]
+                start_ms = tr["start_ms"]
+
+                # timeout?
+                if now_ms() - start_ms > WIN_TIMEOUT_MIN*60*1000:
+                    if k in current_day_keys:
+                        stats["losses"] += 1
+                    del active_trades[k]
+                    await tg_send(session, format_result(sym, tr["tf"], direction, "TIMEOUT (counted as LOSS)", entry, sl, tp1))
+                    return
+
+                jt = await bn_book_ticker(session, sym)
+                if not jt: return
+                bid = float(jt["bidPrice"]); ask = float(jt["askPrice"])
+
+                if direction == "Long":
+                    # win if bid >= tp1 first, loss if ask <= sl first
+                    if bid >= tp1:
+                        if k in current_day_keys:
+                            stats["wins"] += 1
+                        del active_trades[k]
+                        await tg_send(session, format_result(sym, tr["tf"], direction, "WIN (TP1 hit)", entry, sl, tp1))
+                    elif ask <= sl:
+                        if k in current_day_keys:
+                            stats["losses"] += 1
+                        del active_trades[k]
+                        await tg_send(session, format_result(sym, tr["tf"], direction, "LOSS (SL hit)", entry, sl, tp1))
+                else:
+                    # Short: win if ask <= tp1, loss if bid >= sl
+                    if ask <= tp1:
+                        if k in current_day_keys:
+                            stats["wins"] += 1
+                        del active_trades[k]
+                        await tg_send(session, format_result(sym, tr["tf"], direction, "WIN (TP1 hit)", entry, sl, tp1))
+                    elif bid >= sl:
+                        if k in current_day_keys:
+                            stats["losses"] += 1
+                        del active_trades[k]
+                        await tg_send(session, format_result(sym, tr["tf"], direction, "LOSS (SL hit)", entry, sl, tp1))
+        await asyncio.gather(*(resolve_one(k) for k in keys))
+        await asyncio.sleep(5)
+
+# ========= DAILY STATS PUSH AT 22:00 RIYADH =========
+async def daily_stats_loop(session):
+    while True:
+        sleep_s, target_dt = seconds_until_riyadh(STATS_DAILY_HOUR, 0)
+        await asyncio.sleep(sleep_s)
+        # Compose period string: 22:00 yesterday -> 22:00 today
+        today_2200 = target_dt
+        yesterday_2200 = today_2200 - timedelta(days=1)
+        period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} → {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
+
+        # Build & send daily digest
+        line = format_stats_line()
+        msg = f"[DAILY STATS]\nPeriod: {period_str}\n{line}"
+        await tg_send(session, msg)
+
+        # Reset for next day window
+        stats["unique"] = 0
+        stats["wins"] = 0
+        stats["losses"] = 0
+        current_day_keys.clear()
+        # Note: do NOT clear active_trades; if older trades resolve after the cutoff,
+        # they won't be counted in the new day's stats.
 
 # ========= WEB HEALTH =========
 async def health(_): return web.Response(text="ok")
@@ -423,6 +589,8 @@ async def app_main():
             asyncio.create_task(scan_loop(session, symbols, "1m")),
             asyncio.create_task(scan_loop(session, symbols, "5m")),
             asyncio.create_task(scan_loop(session, symbols, "15m")),
+            asyncio.create_task(result_resolver_loop(session)),
+            asyncio.create_task(daily_stats_loop(session)),   # daily digest at 22:00 Riyadh
         ]
 
         # Minimal web server for Railway health

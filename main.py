@@ -1,15 +1,16 @@
 # app.py — Binance USDT-M PERPS scanner
-# R:R=1:2 (TP1, TP2), trailing stop only after TP1, STRICT OI rule (z & delta), extra volume filter,
-# fake-move wick filter, 4h cooldown AFTER a trade, ALL perps auto-scan, aiohttp+uvloop,
-# daily stats at 22:00 Asia/Riyadh, Telegram alerts, /healthz.
+# R:R=1:2 (TP1, TP2); trailing stop only after TP1; STRICT OI rule (z-score & delta);
+# extra light volume filter; fake-move wick filter; 4h cooldown AFTER a trade;
+# ALL perps auto-scan; daily stats 22:00 Asia/Riyadh; Telegram alerts; /healthz.
+# Fix: HTTP server now uses AppRunner/TCPSite (no thread/signal crash).
 
 import sys, subprocess, os
 def _ensure(pkgs):
     import importlib
     miss=[]
     for p in pkgs:
-        m=p.split("==")[0].split(">=")[0].split("[")[0]
-        try: importlib.import_module(m.replace("-","_"))
+        base=p.split("==")[0].split(">=")[0].split("[")[0].replace("-","_")
+        try: importlib.import_module(base)
         except Exception: miss.append(p)
     if miss:
         print("Installing:", miss, flush=True)
@@ -19,7 +20,7 @@ _ensure([
     "structlog>=24.1.0","tzdata>=2024.1","orjson>=3.10.7",
 ])
 
-import asyncio, aiohttp, orjson, time, math
+import asyncio, aiohttp, orjson, time
 from typing import List, Dict, Any, Optional, Deque, Tuple
 from collections import deque, defaultdict
 from datetime import datetime, timedelta, timezone
@@ -31,14 +32,12 @@ from pydantic import field_validator
 
 # ---------------- Settings ----------------
 class Settings(BaseSettings):
-    # Core scan
-    SYMBOLS: str | List[str] = "ALL"      # "ALL" or CSV e.g. "BTCUSDT,ETHUSDT"
+    SYMBOLS: str | List[str] = "ALL"
     TIMEFRAMES: List[str] = ["5m","15m"]
     MAX_SYMBOLS: int = 200
     WS_CHUNK_SIZE: int = 80
-    BACKFILL_LIMIT: int = 60              # >= ATR_LEN+1
+    BACKFILL_LIMIT: int = 60
 
-    # Confirmations & basic filters
     BREAKOUT_PAD_BP: int = 10
     BODY_RATIO_MIN: float = 0.60
     RETEST_BARS: int = 2
@@ -50,42 +49,33 @@ class Settings(BaseSettings):
     TOB_IMB_MIN: float = 0.15
     SPREAD_MAX_BP: int = 5
 
-    # Extra (light) volume filter
     VOL_SMA_LEN: int = 20
-    VOL_SMA_RATIO_MIN: float = 1.10      # vol >= 1.1 × SMA20
+    VOL_SMA_RATIO_MIN: float = 1.10
 
-    # STRICT Open Interest filters (must satisfy BOTH)
-    OI_LOOKBACK: str = "5m"               # hist bucket
-    OI_Z_MIN: float = 1.0                 # z-score threshold
-    OI_DELTA_MIN: float = 0.005           # +0.5% vs mean threshold
+    OI_LOOKBACK: str = "5m"
+    OI_Z_MIN: float = 1.0
+    OI_DELTA_MIN: float = 0.005
 
-    # Fake-move light filter (adverse wick share upper bound)
-    WICK_SIDE_MAX: float = 0.35           # 0..1 ; LONG: upper wick share; SHORT: lower wick share
+    WICK_SIDE_MAX: float = 0.35
 
-    # Entry/Exit & Risk (R:R = 1:2)
     ATR_LEN: int = 14
-    ATR_SL_MULT: float = 1.5              # SL distance = ATR×mult
-    ENTRY_MODE: str = "MARKET"            # "MARKET" | "RETEST"
+    ATR_SL_MULT: float = 1.5
+    ENTRY_MODE: str = "MARKET"
     MAX_RISK_PCT: float = 1.0
     ACCOUNT_EQUITY_USDT: Optional[float] = None
     SLIPPAGE_BP: int = 3
     DRY_RUN: bool = True
 
-    # Trailing stop (ONLY after TP1)
     TRAIL_ATR_MULT: float = 1.0
 
-    # Cooldown AFTER a trade
-    COOLDOWN_AFTER_TRADE_SEC: int = 14400 # 4 hours
+    COOLDOWN_AFTER_TRADE_SEC: int = 14400  # 4h
 
-    # Ops
     LOG_LEVEL: str = "INFO"
     DATA_DIR: str = "./data"
 
-    # Telegram
     TELEGRAM_BOT_TOKEN: Optional[str] = None
     TELEGRAM_CHAT_ID: Optional[str] = None
 
-    # Server
     HOST: str = "0.0.0.0"
     PORT: int = int(os.getenv("PORT", "8080"))
     TZ: str = "Asia/Riyadh"
@@ -155,7 +145,7 @@ class Signal:
 # ------------- Binance REST/WS -------------
 BASE_REST = "https://fapi.binance.com"
 BASE_WS   = "wss://fstream.binance.com/stream"
-REST_SESSION: Optional[aiohttp.ClientSession] = None  # set in main()
+REST_SESSION: Optional[aiohttp.ClientSession] = None
 BINANCE_CLIENT = None
 
 async def discover_perp_usdt_symbols(session: aiohttp.ClientSession, max_symbols:int) -> List[str]:
@@ -233,7 +223,7 @@ class WSStreamMulti:
 class OrderBookTracker:
     def __init__(self): self.tops:Dict[str,BookTop]={}
     def update_book_ticker(self, sym:str, d:dict):
-        self.tops[sym.upper()] = BookTop(float(d["b"]),float(d["B"]),float(d["a"]),float(d["A"]))
+        self.tops[sym.upper()] = BookTop(float(d.get("b",0)),float(d.get("B",0)),float(d.get("a",0)),float(d.get("A",0)))
     def top(self, sym:str)->Optional[BookTop]: return self.tops.get(sym.upper())
 
 class RetestState:
@@ -305,7 +295,6 @@ class BreakoutEngine:
         sr=self._sweep_reclaim(h,l,c,side)
         self._ret(sym,tf).append(RetestState(level,side,self.s.RETEST_BARS,self.s.RETEST_MAX_BP))
         atr_val = atr(list(h), list(l), list(c), S.ATR_LEN)
-        # Adverse-wick light filter (fake-move guard)
         rng=max(h[-1]-l[-1],1e-12)
         if side=="LONG":
             upper_wick=(h[-1]-max(c[-1],o[-1]))/rng
@@ -318,7 +307,7 @@ class BreakoutEngine:
                       htf_bias_ok=True, tob_imbalance=0.0, vol_z=0.0, spread_bp=None,
                       atr_val=atr_val)
 
-# ------------- Telegram & Health -------------
+# ------------- Telegram -------------
 class Telegram:
     def __init__(self, token:str, chat_id:str):
         self.api=f"https://api.telegram.org/bot{token}"; self.chat_id=chat_id
@@ -329,12 +318,23 @@ class Telegram:
             }) as r:
                 if r.status!=200: print("Telegram error:", r.status, await r.text())
 
+# ------------- HTTP server (no signal handlers, no threads) -------------
 class HealthServer:
-    def __init__(self, host:str, port:int, state:dict):
-        self.app=web.Application(); self.state=state
+    def __init__(self, state:dict):
+        self.app=web.Application()
+        self.state=state
         self.app.add_routes([web.get("/healthz", self.health)])
-        self.host=host; self.port=port
-    async def health(self, req): 
+        self.runner=None
+        self.site=None
+    async def start(self, host:str, port:int):
+        self.runner=web.AppRunner(self.app)
+        await self.runner.setup()
+        self.site=web.TCPSite(self.runner, host=host, port=port)
+        await self.site.start()
+    async def stop(self):
+        if self.runner:
+            await self.runner.cleanup()
+    async def health(self, req):
         return web.json_response({
             "ok":True,
             "uptime_sec":int(time.time()-self.state.get("start_time",time.time())),
@@ -345,7 +345,6 @@ class HealthServer:
             "open_trades": list(OPEN_TRADES.keys()),
             "today_stats": DAILY_STATS.get(local_day_key(), {}),
         })
-    def run(self): web.run_app(self.app, host=self.host, port=self.port)
 
 # ------------- Helpers & Stats -------------
 def _fmt_pct(a: float, b: float) -> float:
@@ -360,17 +359,12 @@ STATE={"start_time":int(time.time()),"last_kline":{},"last_alert":{},"symbols":[
 OB=OrderBookTracker()
 BE=BreakoutEngine(S)
 
-# Cooldown AFTER a trade
-LAST_TRADE_TS: Dict[str, int] = {}          # symbol -> last trade closed/opened time (we use on open)
-COOLDOWN_AFTER_TRADE_SEC = S.COOLDOWN_AFTER_TRADE_SEC
+LAST_TRADE_TS: Dict[str, int] = {}
+OPEN_TRADES: Dict[str, Dict[str, Any]] = {}
 
-# Open trades
-OPEN_TRADES: Dict[str, Dict[str, Any]] = {} # symbol -> trade dict
-
-# Daily stats (in R)
 DAILY_STATS: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
     "count": 0, "wins_tp2": 0, "wins_ts": 0, "losses_sl": 0,
-    "sum_R": 0.0, "best": None, "worst": None  # best/worst tuples: (symbol, R)
+    "sum_R": 0.0, "best": None, "worst": None
 })
 
 def stats_add_trade_result(symbol: str, R: float, outcome: str):
@@ -378,17 +372,11 @@ def stats_add_trade_result(symbol: str, R: float, outcome: str):
     st = DAILY_STATS[key]
     st["count"] += 1
     st["sum_R"] += R
-    if outcome == "TP2":
-        st["wins_tp2"] += 1
-    elif outcome == "TS":
-        st["wins_ts"] += 1
-    elif outcome == "SL":
-        st["losses_sl"] += 1
-    # best/worst
-    if st["best"] is None or R > st["best"][1]:
-        st["best"] = (symbol, R)
-    if st["worst"] is None or R < st["worst"][1]:
-        st["worst"] = (symbol, R)
+    if outcome == "TP2": st["wins_tp2"] += 1
+    elif outcome == "TS": st["wins_ts"] += 1
+    elif outcome == "SL": st["losses_sl"] += 1
+    if st["best"] is None or R > st["best"][1]: st["best"] = (symbol, R)
+    if st["worst"] is None or R < st["worst"][1]: st["worst"] = (symbol, R)
 
 def compose_daily_summary() -> str:
     key = local_day_key()
@@ -404,22 +392,18 @@ def compose_daily_summary() -> str:
     return (
         f"📅 Daily Stats – {key}\n"
         f"Trades: {st['count']}\n"
-        f"Wins: {wins}  (TP2: {st['wins_tp2']}, TS: {st['wins_ts']}) | "
-        f"Losses (SL): {losses}\n"
-        f"Hit rate: {hit:.1f}%\n"
-        f"Net R: {st['sum_R']:+.2f}R   Avg R: {avg_R:+.2f}R\n"
+        f"Wins: {wins}  (TP2: {st['wins_tp2']}, TS: {st['wins_ts']}) | Losses (SL): {losses}\n"
+        f"Hit rate: {hit:.1f}%  |  Net: {st['sum_R']:+.2f}R  |  Avg: {avg_R:+.2f}R\n"
         f"Best: {best}   Worst: {worst}"
     )
 
 def seconds_until_next_2200_riyadh() -> float:
     now = riyadh_now()
     target = now.replace(hour=22, minute=0, second=0, microsecond=0)
-    if now >= target:
-        target = target + timedelta(days=1)
+    if now >= target: target = target + timedelta(days=1)
     return (target - now).total_seconds()
 
 async def daily_stats_loop():
-    # wait until next 22:00 Riyadh, then every 24h
     await asyncio.sleep(max(1.0, seconds_until_next_2200_riyadh()))
     while True:
         try:
@@ -427,7 +411,6 @@ async def daily_stats_loop():
             await alert(summary, "DAILY")
         except Exception as e:
             log.warning("daily_stats_err", error=str(e))
-        # reset tomorrow? We keep historical per-day; a new day gets its own bucket automatically.
         await asyncio.sleep(24 * 3600)
 
 def _log_event(obj: Dict[str, Any]):
@@ -435,17 +418,14 @@ def _log_event(obj: Dict[str, Any]):
     path=os.path.join(S.DATA_DIR,"events.jsonl")
     with open(path,"ab") as f: f.write(orjson.dumps(obj)+b"\n")
 
-# ----------- Signal handling -----------
+# ----------- OI (STRICT: z & delta must BOTH pass) -----------
 async def fetch_oi_strict_ok(symbol: str) -> bool:
-    """STRICT: require BOTH OI z-score >= OI_Z_MIN AND ΔOI% >= OI_DELTA_MIN."""
     try:
         hist = await BINANCE_CLIENT.open_interest_hist(symbol, period=S.OI_LOOKBACK, limit=30)
         cur  = await BINANCE_CLIENT.open_interest(symbol)
-        if not hist or cur is None:
-            return True  # don't block if data unavailable
+        if not hist or cur is None: return True  # don't block on missing OI
         prev = hist[:-1] if len(hist)>1 else hist
-        if len(prev) < 5:
-            return True
+        if len(prev) < 5: return True
         mean = sum(prev)/len(prev)
         var  = sum((x-mean)**2 for x in prev)/len(prev)
         std  = var**0.5
@@ -454,16 +434,20 @@ async def fetch_oi_strict_ok(symbol: str) -> bool:
         return (z >= S.OI_Z_MIN) and (delta_pct >= S.OI_DELTA_MIN)
     except Exception as e:
         log.warning("oi_check_error", symbol=symbol, error=str(e))
-        return True  # permissive on transient API issues
+        return True
 
+# ----------- Signal handling -----------
 async def on_kline(symbol:str, k:dict):
     sym=symbol.upper(); tf=k["i"]
-    cndl=Candle(int(k["t"]), float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["q"]), int(k["T"]))
+    # robust parsing: values may be strings
+    def _f(x): 
+        try: return float(x)
+        except: return 0.0
+    cndl=Candle(int(k["t"]), _f(k["o"]), _f(k["h"]), _f(k["l"]), _f(k["c"]), _f(k.get("q", k.get("Q", 0))), int(k["T"]))
     BE.add_candle(sym, tf, cndl)
     STATE["last_kline"]={"symbol":sym,"tf":tf,"t":k["T"]}
     sig=BE.on_closed_bar(sym, tf)
-    if not sig:
-        return
+    if not sig: return
 
     # HTF SMA gate for 5m using 15m buffer
     if tf=="5m":
@@ -493,9 +477,13 @@ async def on_kline(symbol:str, k:dict):
         if win:
             mean=sum(win)/len(win); var=sum((x-mean)**2 for x in win)/len(win); std=var**0.5 if var>0 else 1.0
             sig.vol_z=(vols[-1]-mean)/std
+        else:
+            sig.vol_z=0.0
         # Extra light filter: vol/SMA20
         sma20 = sma(vols, S.VOL_SMA_LEN) or 0.0
         vol_ratio = (vols[-1] / sma20) if sma20 > 0 else 0.0
+    else:
+        sig.vol_z = getattr(sig,"vol_z",0.0)
 
     # Basic filters
     if not getattr(sig,"htf_bias_ok",True): return
@@ -503,18 +491,16 @@ async def on_kline(symbol:str, k:dict):
     if (sig.spread_bp or 0)>S.SPREAD_MAX_BP: return
     if getattr(sig,"vol_z",0.0)<1.5: return
     if vol_ratio < S.VOL_SMA_RATIO_MIN: return
-    # STRICT OI
     if not await fetch_oi_strict_ok(sym): return
 
-    # Cooldown AFTER TRADE: refuse new trade if same symbol traded within 4h
+    # 4h cooldown AFTER trade open
     now_ts = int(time.time())
-    if now_ts - LAST_TRADE_TS.get(sym, 0) < COOLDOWN_AFTER_TRADE_SEC:
-        return
+    if now_ts - LAST_TRADE_TS.get(sym, 0) < S.COOLDOWN_AFTER_TRADE_SEC: return
     if sym in OPEN_TRADES: return
 
     # Compute Entry/SL, RR 1:2
     if not sig.atr_val or sig.atr_val <= 0:
-        sig.atr_val = sig.price * 0.003  # fallback
+        sig.atr_val = sig.price * 0.003
     pad = S.BREAKOUT_PAD_BP / 10_000
     if S.ENTRY_MODE.upper() == "RETEST":
         entry = sig.level * (1 + pad) if sig.side == "LONG" else sig.level * (1 - pad)
@@ -533,7 +519,6 @@ async def on_kline(symbol:str, k:dict):
         qty = (S.ACCOUNT_EQUITY_USDT * (S.MAX_RISK_PCT / 100.0)) / risk
         qty_txt = f"{qty:.4f}"
 
-    # Save trade (trail only after TP1)
     OPEN_TRADES[sym] = {
         "symbol": sym, "side": sig.side, "tf": tf,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
@@ -542,16 +527,15 @@ async def on_kline(symbol:str, k:dict):
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
         "trail_dist": sig.atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": sig.atr_val
     }
-    # mark last trade time at OPEN to enforce 4h cooldown going forward
     LAST_TRADE_TS[sym] = now_ts
 
-    # Alert
     direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
     tz_dt=to_tz(now_utc(), S.TZ)
     sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
     text=(f"{direction} <b>{sym}</b> <code>{tf}</code>\n"
           f"Price: <b>{sig.price:.6f}</b>  Level: {sig.level:.6f}  Body: {sig.body_ratio:.2f}\n"
-          f"TOB: {sig.tob_imbalance:.2f}  VolZ: {getattr(sig,'vol_z',0):.2f}  Vol/SMA{S.VOL_SMA_LEN}: {vol_ratio:.2f}  Spread(bp): {sig.spread_bp or 0:.1f}\n"
+          f"TOB: {getattr(sig,'tob_imbalance',0):.2f}  VolZ: {getattr(sig,'vol_z',0):.2f}  "
+          f"Vol/SMA{S.VOL_SMA_LEN}: {vol_ratio:.2f}  Spread(bp): {sig.spread_bp or 0:.1f}\n"
           f"HTF bias: {'✅' if sig.htf_bias_ok else '❌'}  Sweep/Reclaim: {'✅' if sig.sweep_reclaim else '—'}\n"
           f"Time: {tz_dt.isoformat()}\n"
           f"\n<b>Plan</b> ({entry_note}, R:R = 1:2):\n"
@@ -590,7 +574,6 @@ async def on_bookticker(symbol:str, data:dict):
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
 
-    # after TP1: trail + TP2
     if side == "LONG":
         if trade["trail_active"]:
             trade["trail_peak"] = max(trade["trail_peak"], mid)
@@ -611,19 +594,13 @@ async def on_bookticker(symbol:str, data:dict):
 async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: float, risk: float):
     trade = OPEN_TRADES.pop(symbol, None)
     if not trade: return
-    # R result
-    if risk <= 0:
-        R = 0.0
+    if risk <= 0: R = 0.0
     else:
         if outcome in ("TP2", "TS"):
-            if trade["side"] == "LONG":
-                R = (exit_price - entry) / risk
-            else:
-                R = (entry - exit_price) / risk
-        else:  # SL
+            R = (exit_price - entry)/risk if trade["side"]=="LONG" else (entry - exit_price)/risk
+        else:
             R = -1.0
     stats_add_trade_result(symbol, R, outcome)
-
     pl_pct = _fmt_pct(exit_price, entry)
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     msg = (f"📌 <b>RESULT</b> {symbol}\n"
@@ -642,20 +619,24 @@ async def alert(text:str, symbol:str):
     await tg.send(text)
     STATE["last_alert"]={"symbol":symbol,"text":text,"ts":int(time.time())}
 
+async def start_http_server(state:dict):
+    server = HealthServer(state)
+    await server.start(S.HOST, S.PORT)
+    log.info("http_started", host=S.HOST, port=S.PORT)
+
 async def main():
     global REST_SESSION, BINANCE_CLIENT
     log.info("boot", tfs=S.TIMEFRAMES, rr="1:2", trailing_after_tp1=True, cooldown_after_trade_sec=S.COOLDOWN_AFTER_TRADE_SEC)
-    # Health server
-    hs=HealthServer(S.HOST, S.PORT, STATE)
-    asyncio.create_task(asyncio.to_thread(hs.run))
 
-    # Daily stats loop (22:00 Riyadh)
+    # Start HTTP server safely in-loop
+    asyncio.create_task(start_http_server(STATE))
+
+    # Daily stats loop
     asyncio.create_task(daily_stats_loop())
 
     REST_SESSION = aiohttp.ClientSession()
     BINANCE_CLIENT = BinanceClient(REST_SESSION)
 
-    # Discover symbols
     if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
         symbols=await discover_perp_usdt_symbols(REST_SESSION, S.MAX_SYMBOLS)
     elif isinstance(S.SYMBOLS, (list, tuple)):
@@ -665,16 +646,30 @@ async def main():
     STATE["symbols"]=symbols
     log.info("symbols_selected", count=len(symbols))
 
-    # Backfill
     for i, sym in enumerate(symbols):
         for tf in S.TIMEFRAMES:
-            await small_backfill(BINANCE_CLIENT, sym, tf)
+            try:
+                await small_backfill(BINANCE_CLIENT, sym, tf)
+            except Exception as e:
+                log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
         if i % 10 == 0:
             await asyncio.sleep(0.2)
 
-    # WS streams chunked
     ws_multi=WSStreamMulti(symbols, S.TIMEFRAMES, on_kline, on_bookticker, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
+
+async def small_backfill(client:"BinanceClient", sym:str, tf:str):
+    data=await client.klines(sym, tf, limit=S.BACKFILL_LIMIT)
+    for k in data[:-1]:
+        o,h,l,c = float(k[1]),float(k[2]),float(k[3]),float(k[4])
+        q = float(k[5]) if len(k)>5 else 0.0
+        BE.add_candle(sym, tf, Candle(int(k[0]), o, h, l, c, q, int(k[6])))
+
+async def on_shutdown():
+    try:
+        if REST_SESSION and not REST_SESSION.closed:
+            await REST_SESSION.close()
+    except Exception: pass
 
 if __name__=="__main__":
     try: uvloop.install()

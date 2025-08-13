@@ -37,16 +37,21 @@ STATS_DAILY_HOUR   = int(os.getenv("STATS_DAILY_HOUR", "22")) # 22:00 Riyadh (UT
 BINANCE_BASE = "https://fapi.binance.com"
 RIYADH_TZ = timezone(timedelta(hours=3))  # no DST
 
+# ========= TIMEFRAMES =========
+# Per your request: replace 1m with 5m using the same logic/thresholds. We now scan 5m and 15m.
+TIMEFRAMES = ["5m","15m"]
+
 # ========= STATE =========
-kbuf = defaultdict(lambda: {
-    '1m':  {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
-    '5m':  {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
-    '15m': {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20), 'cl': deque(maxlen=21), 'last_close': None},
-})
+def make_buf():
+    # keep 20-period vols/highs/lows, 21 closes (for recent range), plus opens for OB detection
+    return {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20),
+            'cl': deque(maxlen=21), 'op': deque(maxlen=21), 'last_close': None}
+
+kbuf = defaultdict(lambda: {tf: make_buf() for tf in TIMEFRAMES})
+
 oi_hist = defaultdict(lambda: deque(maxlen=10))  # symbol -> [(ts_ms, oi_float)]
-last_alert_at = defaultdict(lambda: {'1m':0,'5m':0,'15m':0})
+last_alert_at = defaultdict(lambda: {tf:0 for tf in TIMEFRAMES})
 macro_block_until = 0
-TIMEFRAMES = ["1m","5m","15m"]
 
 # Stats structures
 stats = {"unique": 0, "wins": 0, "losses": 0}
@@ -96,6 +101,8 @@ def next_close_ms(tf):
     if tf=="1m":  return (s - (s%60) + 60)*1000
     if tf=="5m":  return (s - (s%300) + 300)*1000
     if tf=="15m": return (s - (s%900) + 900)*1000
+    # fallback
+    return (s - (s%300) + 300)*1000
 
 def swing_levels(lows, highs):
     sl_long = min(list(lows)[-3:]) if len(lows)>=3 else (min(lows) if lows else None)
@@ -116,31 +123,35 @@ def seconds_until_riyadh(hour=22, minute=0):
         target += timedelta(days=1)
     return (target - now).total_seconds(), target
 
+# ========== MESSAGE FORMATS (with emojis) ==========
 def format_alert(pair, direction, entry, sl, tp1, tp2, reason, tf, score):
+    updown = "📈 Long" if direction=="Long" else "📉 Short"
     return (
-f"[TRADE ALERT]\n"
-f"Pair: {pair}\n"
-f"Direction: {direction}\n"
-f"Entry: {entry:.6f}\n"
-f"Stop Loss: {sl:.6f}\n"
-f"Take Profit Targets: {tp1:.6f}, {tp2:.6f}\n"
-f"Reason: {reason}\n"
-f"Timeframe: {tf}\n"
-f"Confidence Score: {score}/10"
+f"🔔 *TRADE ALERT*\n"
+f"• Pair: `{pair}`\n"
+f"• Direction: {updown}\n"
+f"• Entry: `{entry:.6f}`\n"
+f"• Stop Loss: `⛔ {sl:.6f}`\n"
+f"• Take Profits: `🎯 {tp1:.6f}`, `🎯 {tp2:.6f}`\n"
+f"• Timeframe: `{tf}`\n"
+f"• Confidence: `🧠 {score}/10`\n"
+f"• Reason: {reason}"
 )
 
 def format_result(pair, tf, direction, result, entry, sl, tp1):
+    tag = "✅ WIN" if "WIN" in result else ("⏱️ TIMEOUT" if "TIMEOUT" in result else "❌ LOSS")
+    updown = "📈 Long" if direction=="Long" else "📉 Short"
     return (
-f"[RESULT] {result}\n"
-f"Pair: {pair}  TF: {tf}\n"
-f"Direction: {direction}\n"
-f"Entry: {entry:.6f}  SL: {sl:.6f}  TP1: {tp1:.6f}"
+f"{tag}\n"
+f"• Pair: `{pair}` | TF: `{tf}` | {updown}\n"
+f"• Entry: `{entry:.6f}` | SL: `{sl:.6f}` | TP1: `{tp1:.6f}`\n"
+f"• Result: {result}"
 )
 
 def format_stats_line():
     total = stats["unique"]; wins = stats["wins"]; losses = stats["losses"]
     wr = (wins / total * 100.0) if total > 0 else 0.0
-    return f"Unique Alerts: {total} | Wins: {wins} | Losses: {losses} | Win rate: {wr:.1f}%"
+    return f"📊 Unique Alerts: *{total}* | 🟢 Wins: *{wins}* | 🔴 Losses: *{losses}* | 🧮 Win rate: *{wr:.1f}%*"
 
 # ========= BINANCE WRAPPERS =========
 async def bn_exchange_info(session):
@@ -196,9 +207,10 @@ async def warmup_klines(session, symbols):
             data = await bn_klines(session, sym, tf, limit=21)
             if not data or len(data)<21: return
             for row in data[:-1]:
-                h,l,c,vol,ct = float(row[2]), float(row[3]), float(row[4]), float(row[5]), int(row[6])
+                o,h,l,c,vol,ct = float(row[1]), float(row[2]), float(row[3]), float(row[4]), float(row[5]), int(row[6])
                 buf = kbuf[sym][tf]
-                buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(vol); buf['cl'].append(c); buf['last_close']=ct
+                buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(vol)
+                buf['cl'].append(c); buf['op'].append(o); buf['last_close']=ct
     await asyncio.gather(*(load(s, tf) for s in symbols for tf in TIMEFRAMES))
 
 # ========= OI (1/min) =========
@@ -230,6 +242,7 @@ def oi_5min_change_pct(sym):
 
 # ========= MACRO BTC SHOCK =========
 async def macro_guard_loop(session):
+    # keep macro shock on 1m BTC for responsiveness (unchanged)
     global macro_block_until
     sym, tf = "BTCUSDT", "1m"
     while True:
@@ -267,7 +280,9 @@ def session_soft_flag(tf, closes):
     if len(closes) < 20: return True  # cautious
     rets = [abs((closes[i]-closes[i-1])/closes[i-1]) for i in range(1,len(closes))]
     atrp = sum(rets[-20:])/20.0
-    th = {"1m":0.0015, "5m":0.0035, "15m":0.0060}.get(tf, 0.003)
+    # thresholds tuned (kept same spirit; 5m ~0.35%, 15m ~0.60%)
+    th_map = {"5m":0.0035, "15m":0.0060}
+    th = th_map.get(tf, 0.0035)
     return atrp < th
 
 # ========= SPREAD & DEPTH (MUST) =========
@@ -288,6 +303,41 @@ def depth_checks(orderbook, price):
         return True, spread, depth_usd
     except Exception:
         return False, 1.0, 0.0
+
+# ========= ORDER BLOCK (OB) CONFIRMATION (SOFT) =========
+def ob_confirmation(buf, direction, entry):
+    """
+    Very lightweight OB heuristic (last ~12 candles):
+      • Bullish (demand) OB: most-recent bearish candle that swept recent lows.
+      • Bearish (supply) OB: most-recent bullish candle that swept recent highs.
+    If found, returns (True, "🧱OB✅"); else (False, "🧱OB✖").
+    """
+    hi = list(buf['hi']); lo = list(buf['lo'])
+    op = list(buf['op']); cl = list(buf['cl'])
+    n = min(len(op), len(cl), len(hi), len(lo))
+    if n < 6:
+        return False, "🧱OB✖"
+    lookback = min(12, n-1)
+
+    if direction == "Long":
+        # find most recent bearish candle that made/swept a local low
+        recent_low = min(lo[max(0, n-lookback-1):n-1])
+        for i in range(n-2, max(-1, n-lookback-2), -1):
+            if cl[i] < op[i] and lo[i] <= recent_low:
+                # optional proximity check (entry not far above OB open)
+                if entry >= op[i] and (entry - lo[i]) / max(1e-9, entry) <= 0.01:  # within ~1%
+                    return True, "🧱OB✅"
+                return True, "🧱OB✅"
+        return False, "🧱OB✖"
+
+    else:  # Short
+        recent_high = max(hi[max(0, n-lookback-1):n-1])
+        for i in range(n-2, max(-1, n-lookback-2), -1):
+            if cl[i] > op[i] and hi[i] >= recent_high:
+                if entry <= op[i] and (hi[i] - entry) / max(1e-9, entry) <= 0.01:
+                    return True, "🧱OB✅"
+                return True, "🧱OB✅"
+        return False, "🧱OB✖"
 
 # ========= PRICE ACTION + VOL (+ REVERSAL) =========
 def detect_signal(sym, tf, last_closed_row, prev_row=None):
@@ -336,8 +386,10 @@ def detect_signal(sym, tf, last_closed_row, prev_row=None):
         bear_engulf = body_engulf_down and sweep_up
 
     # update buffers after evaluating
-    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v); buf['cl'].append(c); buf['last_close']=close_time
+    buf['hi'].append(h); buf['lo'].append(l); buf['vol'].append(v)
+    buf['cl'].append(c); buf['op'].append(o); buf['last_close']=close_time
     if len(buf['cl'])>21: buf['cl'].popleft()
+    if len(buf['op'])>21: buf['op'].popleft()
 
     if not vol_ok:
         return None
@@ -393,9 +445,9 @@ async def scan_loop(session, symbols, tf):
                     return
 
                 # --- Spread & depth (must) ---
-                ob = await bn_depth(session, sym, limit=100)
+                obk = await bn_depth(session, sym, limit=100)
                 price = sig['close']
-                ok_depth, spread, depth_usd = depth_checks(ob, price)
+                ok_depth, spread, depth_usd = depth_checks(obk, price)
                 if not ok_depth:
                     return
 
@@ -408,14 +460,14 @@ async def scan_loop(session, symbols, tf):
                     sl = sl_long
                     risk = max(1e-9, entry - sl)
                     tp1, tp2 = entry + 0.75*risk, entry + 1.50*risk
-                    reason_prefix = "Breakout + pad" if entry > max(buf['cl']) else "Engulfing reversal + sweep"
+                    reason_prefix = "🚀 Breakout+pad" if entry > max(buf['cl']) else "🔁 Engulfing reversal+sweep"
                     risk_pct = (entry - sl)/entry if sl else 999
                 elif sig['direction']=="Short" and sl_short is not None:
                     if not rr_ok(entry, sl_short): return
                     sl = sl_short
                     risk = max(1e-9, sl - entry)
                     tp1, tp2 = entry - 0.75*risk, entry - 1.50*risk
-                    reason_prefix = "Breakdown + pad" if entry < min(buf['cl']) else "Engulfing reversal + sweep"
+                    reason_prefix = "🧨 Breakdown+pad" if entry < min(buf['cl']) else "🔁 Engulfing reversal+sweep"
                     risk_pct = (sl - entry)/entry if sl else 999
                 else:
                     return
@@ -432,6 +484,9 @@ async def scan_loop(session, symbols, tf):
                     if sig['direction']=="Short" and (btc5m >  0.007 or eth5m >  0.007):
                         return
 
+                # --- OB confirmation (soft) ---
+                has_ob, ob_tag = ob_confirmation(buf, sig['direction'], entry)
+
                 # --- Debounce per symbol/tf ---
                 now_s = int(time.time())
                 if now_s - last_alert_at[sym][tf] < COOLDOWN_SEC: return
@@ -439,21 +494,31 @@ async def scan_loop(session, symbols, tf):
 
                 # --- Score ---
                 score = 6  # core musts passed
-                info_bits = [f"Vol≥{VOL_SURGE_MIN:.2f}x", f"Funding {fr*100:.3f}%", f"Spread {spread*100:.2f}%", f"Depth1% ${depth_usd:,.0f}"]
+                info_bits = [
+                    f"📦Vol≥{VOL_SURGE_MIN:.2f}x",
+                    f"💸Funding {fr*100:.3f}%",
+                    f"🔎Spread {spread*100:.2f}%",
+                    f"🏦Depth1% ${depth_usd:,.0f}",
+                ]
                 if oi_soft_fail:
-                    score -= 1; info_bits.append("OI soft-fail")
+                    score -= 1; info_bits.append("📉OI soft-fail")
                 else:
-                    score += 1; info_bits.append(f"OIΔ5m {oi_pct*100:.2f}%")
+                    score += 1; info_bits.append(f"📈OIΔ5m {oi_pct*100:.2f}%")
                 if corr_soft:
-                    score -= 1; info_bits.append(f"Corr soft: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
+                    score -= 1; info_bits.append(f"⚠️Corr: BTC {btc5m*100:.2f}%, ETH {eth5m*100:.2f}%")
                 else:
-                    score += 1
+                    score += 1; info_bits.append("🔗Corr OK")
                 # session softness
                 sess_soft = session_soft_flag(tf, list(buf['cl']))
                 if sess_soft:
-                    score -= 1; info_bits.append("Session soft")
+                    score -= 1; info_bits.append("🌫️Session soft")
                 else:
-                    score += 1
+                    score += 1; info_bits.append("🌞Session OK")
+                # OB confirmation
+                if has_ob:
+                    score += 1; info_bits.append(ob_tag)
+                else:
+                    score -= 1; info_bits.append(ob_tag)
 
                 reason = f"{reason_prefix}; " + ", ".join(info_bits)
 
@@ -560,7 +625,7 @@ async def daily_stats_loop(session):
 
         # Build & send daily digest
         line = format_stats_line()
-        msg = f"[DAILY STATS]\nPeriod: {period_str}\n{line}"
+        msg = f"🗓️ *DAILY STATS*\nPeriod: {period_str}\n{line}"
         await tg_send(session, msg)
 
         # Reset for next day window
@@ -572,7 +637,7 @@ async def daily_stats_loop(session):
         # they won't be counted in the new day's stats.
 
 # ========= WEB HEALTH =========
-async def health(_): return web.Response(text="ok")
+async def health(_): return web.Response(text="ok ✅")
 
 async def app_main():
     async with aiohttp.ClientSession() as session:
@@ -586,7 +651,6 @@ async def app_main():
         tasks = [
             asyncio.create_task(oi_loop(session, symbols)),
             asyncio.create_task(macro_guard_loop(session)),
-            asyncio.create_task(scan_loop(session, symbols, "1m")),
             asyncio.create_task(scan_loop(session, symbols, "5m")),
             asyncio.create_task(scan_loop(session, symbols, "15m")),
             asyncio.create_task(result_resolver_loop(session)),

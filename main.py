@@ -1,6 +1,7 @@
 # app.py — Binance USDT-M PERPS scanner
-# R:R=1:2 (TP1, TP2), trailing stop only after TP1, OI filter, extra volume filter, fake-move wick filter,
-# 6h cooldown per symbol, ALL perps auto-scan, aiohttp+uvloop, /healthz, Telegram alerts.
+# R:R=1:2 (TP1, TP2), trailing stop only after TP1, STRICT OI rule (z & delta), extra volume filter,
+# fake-move wick filter, 4h cooldown AFTER a trade, ALL perps auto-scan, aiohttp+uvloop,
+# daily stats at 22:00 Asia/Riyadh, Telegram alerts, /healthz.
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -18,10 +19,10 @@ _ensure([
     "structlog>=24.1.0","tzdata>=2024.1","orjson>=3.10.7",
 ])
 
-import asyncio, aiohttp, orjson, time
+import asyncio, aiohttp, orjson, time, math
 from typing import List, Dict, Any, Optional, Deque, Tuple
-from collections import deque
-from datetime import datetime, timezone
+from collections import deque, defaultdict
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 import structlog, uvloop
 from aiohttp import web
@@ -49,21 +50,21 @@ class Settings(BaseSettings):
     TOB_IMB_MIN: float = 0.15
     SPREAD_MAX_BP: int = 5
 
-    # NEW: Extra light volume filter
+    # Extra (light) volume filter
     VOL_SMA_LEN: int = 20
     VOL_SMA_RATIO_MIN: float = 1.10      # vol >= 1.1 × SMA20
 
-    # NEW: Open Interest filters
+    # STRICT Open Interest filters (must satisfy BOTH)
     OI_LOOKBACK: str = "5m"               # hist bucket
     OI_Z_MIN: float = 1.0                 # z-score threshold
-    OI_DELTA_MIN: float = 0.005           # +0.5% vs mean (or last) threshold
+    OI_DELTA_MIN: float = 0.005           # +0.5% vs mean threshold
 
-    # NEW: Fake-move light filter (adverse wick share upper bound)
+    # Fake-move light filter (adverse wick share upper bound)
     WICK_SIDE_MAX: float = 0.35           # 0..1 ; LONG: upper wick share; SHORT: lower wick share
 
     # Entry/Exit & Risk (R:R = 1:2)
     ATR_LEN: int = 14
-    ATR_SL_MULT: float = 1.5              # defines SL distance (ATR×mult)
+    ATR_SL_MULT: float = 1.5              # SL distance = ATR×mult
     ENTRY_MODE: str = "MARKET"            # "MARKET" | "RETEST"
     MAX_RISK_PCT: float = 1.0
     ACCOUNT_EQUITY_USDT: Optional[float] = None
@@ -73,8 +74,10 @@ class Settings(BaseSettings):
     # Trailing stop (ONLY after TP1)
     TRAIL_ATR_MULT: float = 1.0
 
+    # Cooldown AFTER a trade
+    COOLDOWN_AFTER_TRADE_SEC: int = 14400 # 4 hours
+
     # Ops
-    COOLDOWN_SEC: int = 21600             # 6 hours
     LOG_LEVEL: str = "INFO"
     DATA_DIR: str = "./data"
 
@@ -123,6 +126,7 @@ log = setup_logging(S.LOG_LEVEL)
 # ---------------- Utils/TA ----------------
 def now_utc() -> datetime: return datetime.now(timezone.utc)
 def to_tz(dt: datetime, tz: str) -> datetime: return dt.astimezone(ZoneInfo(tz))
+def riyadh_now() -> datetime: return to_tz(now_utc(), S.TZ)
 def percent_bp(a: float, b: float) -> float: return 0.0 if b==0 else (a-b)/b*10_000
 def body_ratio(o,h,l,c): rng=max(h-l,1e-12); return abs(c-o)/rng
 def sma(vals: List[float], n:int)->Optional[float]:
@@ -339,55 +343,119 @@ class HealthServer:
             "symbols":self.state.get("symbols",[]),
             "timeframes":self.state.get("timeframes",[]),
             "open_trades": list(OPEN_TRADES.keys()),
+            "today_stats": DAILY_STATS.get(local_day_key(), {}),
         })
     def run(self): web.run_app(self.app, host=self.host, port=self.port)
 
-# ------------- Helpers -------------
+# ------------- Helpers & Stats -------------
 def _fmt_pct(a: float, b: float) -> float:
     if b == 0: return 0.0
     return (a/b - 1.0) * 100.0
+
+def local_day_key(dt: Optional[datetime]=None) -> str:
+    d = riyadh_now() if dt is None else to_tz(dt, S.TZ)
+    return d.strftime("%Y-%m-%d")
 
 STATE={"start_time":int(time.time()),"last_kline":{},"last_alert":{},"symbols":[], "timeframes":S.TIMEFRAMES}
 OB=OrderBookTracker()
 BE=BreakoutEngine(S)
 
-LAST_SIGNAL_TS: Dict[str, int] = {}      # cooldown
-OPEN_TRADES: Dict[str, Dict[str, Any]] = {}  # symbol -> trade dict
+# Cooldown AFTER a trade
+LAST_TRADE_TS: Dict[str, int] = {}          # symbol -> last trade closed/opened time (we use on open)
+COOLDOWN_AFTER_TRADE_SEC = S.COOLDOWN_AFTER_TRADE_SEC
+
+# Open trades
+OPEN_TRADES: Dict[str, Dict[str, Any]] = {} # symbol -> trade dict
+
+# Daily stats (in R)
+DAILY_STATS: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
+    "count": 0, "wins_tp2": 0, "wins_ts": 0, "losses_sl": 0,
+    "sum_R": 0.0, "best": None, "worst": None  # best/worst tuples: (symbol, R)
+})
+
+def stats_add_trade_result(symbol: str, R: float, outcome: str):
+    key = local_day_key()
+    st = DAILY_STATS[key]
+    st["count"] += 1
+    st["sum_R"] += R
+    if outcome == "TP2":
+        st["wins_tp2"] += 1
+    elif outcome == "TS":
+        st["wins_ts"] += 1
+    elif outcome == "SL":
+        st["losses_sl"] += 1
+    # best/worst
+    if st["best"] is None or R > st["best"][1]:
+        st["best"] = (symbol, R)
+    if st["worst"] is None or R < st["worst"][1]:
+        st["worst"] = (symbol, R)
+
+def compose_daily_summary() -> str:
+    key = local_day_key()
+    st = DAILY_STATS.get(key, {})
+    if not st or st["count"] == 0:
+        return f"📅 Daily Stats – {key}\nNo trades today."
+    wins = st["wins_tp2"] + st["wins_ts"]
+    losses = st["losses_sl"]
+    hit = (wins / st["count"]) * 100.0 if st["count"] > 0 else 0.0
+    avg_R = (st["sum_R"] / st["count"]) if st["count"] > 0 else 0.0
+    best = f"{st['best'][0]} {st['best'][1]:+.2f}R" if st.get("best") else "—"
+    worst = f"{st['worst'][0]} {st['worst'][1]:+.2f}R" if st.get("worst") else "—"
+    return (
+        f"📅 Daily Stats – {key}\n"
+        f"Trades: {st['count']}\n"
+        f"Wins: {wins}  (TP2: {st['wins_tp2']}, TS: {st['wins_ts']}) | "
+        f"Losses (SL): {losses}\n"
+        f"Hit rate: {hit:.1f}%\n"
+        f"Net R: {st['sum_R']:+.2f}R   Avg R: {avg_R:+.2f}R\n"
+        f"Best: {best}   Worst: {worst}"
+    )
+
+def seconds_until_next_2200_riyadh() -> float:
+    now = riyadh_now()
+    target = now.replace(hour=22, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target = target + timedelta(days=1)
+    return (target - now).total_seconds()
+
+async def daily_stats_loop():
+    # wait until next 22:00 Riyadh, then every 24h
+    await asyncio.sleep(max(1.0, seconds_until_next_2200_riyadh()))
+    while True:
+        try:
+            summary = compose_daily_summary()
+            await alert(summary, "DAILY")
+        except Exception as e:
+            log.warning("daily_stats_err", error=str(e))
+        # reset tomorrow? We keep historical per-day; a new day gets its own bucket automatically.
+        await asyncio.sleep(24 * 3600)
 
 def _log_event(obj: Dict[str, Any]):
     os.makedirs(S.DATA_DIR, exist_ok=True)
     path=os.path.join(S.DATA_DIR,"events.jsonl")
     with open(path,"ab") as f: f.write(orjson.dumps(obj)+b"\n")
 
-async def small_backfill(client:"BinanceClient", sym:str, tf:str):
-    try:
-        data=await client.klines(sym, tf, limit=S.BACKFILL_LIMIT)
-        for k in data[:-1]:
-            BE.add_candle(sym, tf, Candle(int(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4]), float(k[5]), int(k[6])))
-    except Exception as e:
-        log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
-
-async def fetch_oi_signal_ok(symbol: str) -> bool:
-    """Pass if OI z >= OI_Z_MIN OR ΔOI% >= OI_DELTA_MIN. Light but meaningful."""
+# ----------- Signal handling -----------
+async def fetch_oi_strict_ok(symbol: str) -> bool:
+    """STRICT: require BOTH OI z-score >= OI_Z_MIN AND ΔOI% >= OI_DELTA_MIN."""
     try:
         hist = await BINANCE_CLIENT.open_interest_hist(symbol, period=S.OI_LOOKBACK, limit=30)
         cur  = await BINANCE_CLIENT.open_interest(symbol)
-        if not hist or cur is None: 
-            return True  # don't block if OI unavailable
+        if not hist or cur is None:
+            return True  # don't block if data unavailable
         prev = hist[:-1] if len(hist)>1 else hist
-        if len(prev)<5:
+        if len(prev) < 5:
             return True
         mean = sum(prev)/len(prev)
         var  = sum((x-mean)**2 for x in prev)/len(prev)
         std  = var**0.5
         z = 0.0 if std==0 else (cur - mean)/std
         delta_pct = (cur-mean)/mean if mean>0 else 0.0
-        return (z >= S.OI_Z_MIN) or (delta_pct >= S.OI_DELTA_MIN)
+        return (z >= S.OI_Z_MIN) and (delta_pct >= S.OI_DELTA_MIN)
     except Exception as e:
         log.warning("oi_check_error", symbol=symbol, error=str(e))
-        return True  # be permissive on transient errors
+        return True  # permissive on transient API issues
 
-# ----------- Signal handling -----------
 async def on_kline(symbol:str, k:dict):
     sym=symbol.upper(); tf=k["i"]
     cndl=Candle(int(k["t"]), float(k["o"]), float(k["h"]), float(k["l"]), float(k["c"]), float(k["q"]), int(k["T"]))
@@ -435,14 +503,13 @@ async def on_kline(symbol:str, k:dict):
     if (sig.spread_bp or 0)>S.SPREAD_MAX_BP: return
     if getattr(sig,"vol_z",0.0)<1.5: return
     if vol_ratio < S.VOL_SMA_RATIO_MIN: return
+    # STRICT OI
+    if not await fetch_oi_strict_ok(sym): return
 
-    # OI filter (light but meaningful)
-    if not await fetch_oi_signal_ok(sym):
-        return
-
-    # Cooldown / existing trade
+    # Cooldown AFTER TRADE: refuse new trade if same symbol traded within 4h
     now_ts = int(time.time())
-    if now_ts - LAST_SIGNAL_TS.get(sym, 0) < S.COOLDOWN_SEC: return
+    if now_ts - LAST_TRADE_TS.get(sym, 0) < COOLDOWN_AFTER_TRADE_SEC:
+        return
     if sym in OPEN_TRADES: return
 
     # Compute Entry/SL, RR 1:2
@@ -470,11 +537,13 @@ async def on_kline(symbol:str, k:dict):
     OPEN_TRADES[sym] = {
         "symbol": sym, "side": sig.side, "tf": tf,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
+        "risk": risk,
         "opened_ts": now_ts,
         "tp1_hit": False, "trail_active": False, "trail_peak": None,
         "trail_dist": sig.atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": sig.atr_val
     }
-    LAST_SIGNAL_TS[sym] = now_ts
+    # mark last trade time at OPEN to enforce 4h cooldown going forward
+    LAST_TRADE_TS[sym] = now_ts
 
     # Alert
     direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
@@ -512,11 +581,11 @@ async def on_bookticker(symbol:str, data:dict):
 
     if not trade["tp1_hit"]:
         if side == "LONG":
-            if mid <= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid <= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry, risk=trade["risk"]); return
             if mid >= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         else:
-            if mid >= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid >= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry, risk=trade["risk"]); return
             if mid <= tp1:
                 trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
@@ -527,30 +596,43 @@ async def on_bookticker(symbol:str, data:dict):
             trade["trail_peak"] = max(trade["trail_peak"], mid)
             trail_stop = trade["trail_peak"] - trail_dist
             if mid <= trail_stop:
-                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry); return
+                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry, risk=trade["risk"]); return
         if mid >= tp2:
-            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry); return
+            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry, risk=trade["risk"]); return
     else:
         if trade["trail_active"]:
             trade["trail_peak"] = min(trade["trail_peak"], mid) if trade["trail_peak"] is not None else mid
             trail_stop = trade["trail_peak"] + trail_dist
             if mid >= trail_stop:
-                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry); return
+                await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry, risk=trade["risk"]); return
         if mid <= tp2:
-            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry); return
+            await _close_trade(sym, "TP2", exit_price=tp2, entry=entry, risk=trade["risk"]); return
 
-async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: float):
+async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: float, risk: float):
     trade = OPEN_TRADES.pop(symbol, None)
     if not trade: return
+    # R result
+    if risk <= 0:
+        R = 0.0
+    else:
+        if outcome in ("TP2", "TS"):
+            if trade["side"] == "LONG":
+                R = (exit_price - entry) / risk
+            else:
+                R = (entry - exit_price) / risk
+        else:  # SL
+            R = -1.0
+    stats_add_trade_result(symbol, R, outcome)
+
     pl_pct = _fmt_pct(exit_price, entry)
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     msg = (f"📌 <b>RESULT</b> {symbol}\n"
            f"Outcome: <b>{outcome}</b>\n"
-           f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}%)\n"
+           f"Entry: {entry:.6f} → Exit: {exit_price:.6f}  (PnL: {pl_pct:+.2f}% | {R:+.2f}R)\n"
            f"TP1 hit: {'✅' if trade.get('tp1_hit') else '—'}\n"
            f"Duration: {dur_min:.1f} min  |  Trail ATR: {trade.get('atr_at_entry'):.6f} × {S.TRAIL_ATR_MULT:.2f}")
     await alert(msg, symbol)
-    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "tp1_hit": trade.get("tp1_hit")})
+    _log_event({"ts": int(time.time()), "type": "result", "symbol": symbol, "outcome": outcome, "entry": entry, "exit": exit_price, "pnl_pct": pl_pct, "R": R, "tp1_hit": trade.get("tp1_hit")})
 
 # ------------- Alert + Main -------------
 async def alert(text:str, symbol:str):
@@ -562,12 +644,17 @@ async def alert(text:str, symbol:str):
 
 async def main():
     global REST_SESSION, BINANCE_CLIENT
-    log.info("boot", tfs=S.TIMEFRAMES, cooldown_sec=S.COOLDOWN_SEC, rr="1:2", trailing_after_tp1=True)
+    log.info("boot", tfs=S.TIMEFRAMES, rr="1:2", trailing_after_tp1=True, cooldown_after_trade_sec=S.COOLDOWN_AFTER_TRADE_SEC)
     # Health server
     hs=HealthServer(S.HOST, S.PORT, STATE)
     asyncio.create_task(asyncio.to_thread(hs.run))
+
+    # Daily stats loop (22:00 Riyadh)
+    asyncio.create_task(daily_stats_loop())
+
     REST_SESSION = aiohttp.ClientSession()
     BINANCE_CLIENT = BinanceClient(REST_SESSION)
+
     # Discover symbols
     if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
         symbols=await discover_perp_usdt_symbols(REST_SESSION, S.MAX_SYMBOLS)
@@ -577,12 +664,14 @@ async def main():
         symbols=[str(S.SYMBOLS)]
     STATE["symbols"]=symbols
     log.info("symbols_selected", count=len(symbols))
+
     # Backfill
     for i, sym in enumerate(symbols):
         for tf in S.TIMEFRAMES:
             await small_backfill(BINANCE_CLIENT, sym, tf)
         if i % 10 == 0:
             await asyncio.sleep(0.2)
+
     # WS streams chunked
     ws_multi=WSStreamMulti(symbols, S.TIMEFRAMES, on_kline, on_bookticker, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()

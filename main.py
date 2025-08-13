@@ -1,7 +1,6 @@
-# app.py — ALL Binance USDT-M PERPS auto-scan
-# R:R = 1:2, two targets (TP1, TP2), trailing stop ONLY after TP1
-# Extra (not strict) volume filter: vol >= VOL_SMA_RATIO_MIN * SMA20
-# Async: aiohttp + uvloop, /healthz, Telegram alerts, 6h cooldown, results tracking.
+# app.py — Binance USDT-M PERPS scanner
+# R:R=1:2 (TP1, TP2), trailing stop only after TP1, OI filter, extra volume filter, fake-move wick filter,
+# 6h cooldown per symbol, ALL perps auto-scan, aiohttp+uvloop, /healthz, Telegram alerts.
 
 import sys, subprocess, os
 def _ensure(pkgs):
@@ -15,14 +14,14 @@ def _ensure(pkgs):
         print("Installing:", miss, flush=True)
         subprocess.check_call([sys.executable,"-m","pip","install","--upgrade",*miss])
 _ensure([
-    "aiohttp>=3.9.5", "uvloop>=0.19.0", "pydantic>=2.7.0",
-    "pydantic-settings>=2.2.1", "structlog>=24.1.0", "tzdata>=2024.1", "orjson>=3.10.7",
+    "aiohttp>=3.9.5","uvloop>=0.19.0","pydantic>=2.7.0","pydantic-settings>=2.2.1",
+    "structlog>=24.1.0","tzdata>=2024.1","orjson>=3.10.7",
 ])
 
-import asyncio, aiohttp, orjson, time, math
+import asyncio, aiohttp, orjson, time
 from typing import List, Dict, Any, Optional, Deque, Tuple
 from collections import deque
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 import structlog, uvloop
 from aiohttp import web
@@ -32,13 +31,13 @@ from pydantic import field_validator
 # ---------------- Settings ----------------
 class Settings(BaseSettings):
     # Core scan
-    SYMBOLS: str | List[str] = "ALL"   # "ALL" or CSV like "BTCUSDT,ETHUSDT"
+    SYMBOLS: str | List[str] = "ALL"      # "ALL" or CSV e.g. "BTCUSDT,ETHUSDT"
     TIMEFRAMES: List[str] = ["5m","15m"]
     MAX_SYMBOLS: int = 200
     WS_CHUNK_SIZE: int = 80
-    BACKFILL_LIMIT: int = 60          # >= ATR_LEN+1
+    BACKFILL_LIMIT: int = 60              # >= ATR_LEN+1
 
-    # Confirmations & filters
+    # Confirmations & basic filters
     BREAKOUT_PAD_BP: int = 10
     BODY_RATIO_MIN: float = 0.60
     RETEST_BARS: int = 2
@@ -48,28 +47,34 @@ class Settings(BaseSettings):
     RECLAIM_BODY_RATIO_MIN: float = 0.55
     HTF_SMA_LEN: int = 50
     TOB_IMB_MIN: float = 0.15
-    TOB_STABILITY_CHECKS: int = 1
-    VOL_Z_MIN: float = 1.5
     SPREAD_MAX_BP: int = 5
 
-    # NEW: Extra (not strict) volume filter
+    # NEW: Extra light volume filter
     VOL_SMA_LEN: int = 20
-    VOL_SMA_RATIO_MIN: float = 1.10   # latest vol must be >= 1.1 × SMA20
+    VOL_SMA_RATIO_MIN: float = 1.10      # vol >= 1.1 × SMA20
+
+    # NEW: Open Interest filters
+    OI_LOOKBACK: str = "5m"               # hist bucket
+    OI_Z_MIN: float = 1.0                 # z-score threshold
+    OI_DELTA_MIN: float = 0.005           # +0.5% vs mean (or last) threshold
+
+    # NEW: Fake-move light filter (adverse wick share upper bound)
+    WICK_SIDE_MAX: float = 0.35           # 0..1 ; LONG: upper wick share; SHORT: lower wick share
 
     # Entry/Exit & Risk (R:R = 1:2)
     ATR_LEN: int = 14
-    ATR_SL_MULT: float = 1.5          # SL distance = ATR * this (used to place SL only)
-    ENTRY_MODE: str = "MARKET"        # "MARKET" | "RETEST"
+    ATR_SL_MULT: float = 1.5              # defines SL distance (ATR×mult)
+    ENTRY_MODE: str = "MARKET"            # "MARKET" | "RETEST"
     MAX_RISK_PCT: float = 1.0
     ACCOUNT_EQUITY_USDT: Optional[float] = None
     SLIPPAGE_BP: int = 3
     DRY_RUN: bool = True
 
     # Trailing stop (ONLY after TP1)
-    TRAIL_ATR_MULT: float = 1.0       # trail distance = ATR * this (uses ATR at entry candle)
+    TRAIL_ATR_MULT: float = 1.0
 
     # Ops
-    COOLDOWN_SEC: int = 21600         # 6 hours cooldown per symbol
+    COOLDOWN_SEC: int = 21600             # 6 hours
     LOG_LEVEL: str = "INFO"
     DATA_DIR: str = "./data"
 
@@ -145,11 +150,12 @@ class Signal:
 
 # ------------- Binance REST/WS -------------
 BASE_REST = "https://fapi.binance.com"
-BASE_WS = "wss://fstream.binance.com/stream"
+BASE_WS   = "wss://fstream.binance.com/stream"
+REST_SESSION: Optional[aiohttp.ClientSession] = None  # set in main()
+BINANCE_CLIENT = None
 
 async def discover_perp_usdt_symbols(session: aiohttp.ClientSession, max_symbols:int) -> List[str]:
-    url = f"{BASE_REST}/fapi/v1/exchangeInfo"
-    async with session.get(url) as r:
+    async with session.get(f"{BASE_REST}/fapi/v1/exchangeInfo") as r:
         r.raise_for_status()
         data = await r.json()
     out=[]
@@ -170,25 +176,24 @@ class BinanceClient:
         p={"symbol":symbol.upper(),"interval":interval,"limit":limit}
         async with self.session.get(f"{BASE_REST}/fapi/v1/klines", params=p) as r:
             r.raise_for_status(); return await r.json()
-    async def funding_rate(self, symbol:str)->Optional[float]:
-        p={"symbol":symbol.upper(),"limit":1}
-        async with self.session.get(f"{BASE_REST}/fapi/v1/fundingRate", params=p) as r:
-            r.raise_for_status(); d=await r.json()
-            return float(d[-1]["fundingRate"]) if d else None
-    async def open_interest_z(self, symbol:str, period:str="5m")->Optional[float]:
-        p={"symbol":symbol.upper(),"period":period,"limit":30}
+    async def open_interest_hist(self, symbol:str, period:str="5m", limit:int=30)->Optional[List[float]]:
+        p={"symbol":symbol.upper(),"period":period,"limit":limit}
         async with self.session.get(f"{BASE_REST}/futures/data/openInterestHist", params=p) as r:
             if r.status!=200: return None
             d=await r.json()
-            if not d or len(d)<5: return None
-            vals=[float(x["sumOpenInterest"]) for x in d]
-            m=sum(vals[:-1])/(len(vals)-1)
-            var=sum((v-m)**2 for v in vals[:-1])/(len(vals)-1)
-            std=var**0.5
-            return 0.0 if std==0 else (vals[-1]-m)/std
-    async def mark_price(self, symbol:str)->Optional[float]:
-        async with self.session.get(f"{BASE_REST}/fapi/v1/premiumIndex", params={"symbol":symbol.upper()}) as r:
-            r.raise_for_status(); d=await r.json(); return float(d["markPrice"])
+            if not d: return None
+            return [float(x["sumOpenInterest"]) for x in d]
+    async def open_interest(self, symbol:str)->Optional[float]:
+        async with self.session.get(f"{BASE_REST}/fapi/v1/openInterest", params={"symbol":symbol.upper()}) as r:
+            if r.status!=200: return None
+            d=await r.json()
+            return float(d.get("openInterest", 0))
+    async def funding_rate(self, symbol:str)->Optional[float]:
+        p={"symbol":symbol.upper(),"limit":1}
+        async with self.session.get(f"{BASE_REST}/fapi/v1/fundingRate", params=p) as r:
+            if r.status!=200: return None
+            d=await r.json()
+            return float(d[-1]["fundingRate"]) if d else None
 
 class WSStream:
     def __init__(self, symbols: List[str], timeframes: List[str], on_kline, on_bookticker):
@@ -296,6 +301,14 @@ class BreakoutEngine:
         sr=self._sweep_reclaim(h,l,c,side)
         self._ret(sym,tf).append(RetestState(level,side,self.s.RETEST_BARS,self.s.RETEST_MAX_BP))
         atr_val = atr(list(h), list(l), list(c), S.ATR_LEN)
+        # Adverse-wick light filter (fake-move guard)
+        rng=max(h[-1]-l[-1],1e-12)
+        if side=="LONG":
+            upper_wick=(h[-1]-max(c[-1],o[-1]))/rng
+            if upper_wick > S.WICK_SIDE_MAX: return None
+        else:
+            lower_wick=(min(c[-1],o[-1])-l[-1])/rng
+            if lower_wick > S.WICK_SIDE_MAX: return None
         return Signal(symbol=sym, tf=tf, side=side, price=c[-1], level=level, body_ratio=br,
                       pad_bp=self.s.BREAKOUT_PAD_BP, retest_ok=False, sweep_reclaim=sr,
                       htf_bias_ok=True, tob_imbalance=0.0, vol_z=0.0, spread_bp=None,
@@ -329,17 +342,16 @@ class HealthServer:
         })
     def run(self): web.run_app(self.app, host=self.host, port=self.port)
 
-# ------------- Risk helpers -------------
+# ------------- Helpers -------------
 def _fmt_pct(a: float, b: float) -> float:
     if b == 0: return 0.0
     return (a/b - 1.0) * 100.0
 
-# ------------- App state (cooldown & trades) -------------
 STATE={"start_time":int(time.time()),"last_kline":{},"last_alert":{},"symbols":[], "timeframes":S.TIMEFRAMES}
 OB=OrderBookTracker()
 BE=BreakoutEngine(S)
 
-LAST_SIGNAL_TS: Dict[str, int] = {}      # 6h cooldown per symbol
+LAST_SIGNAL_TS: Dict[str, int] = {}      # cooldown
 OPEN_TRADES: Dict[str, Dict[str, Any]] = {}  # symbol -> trade dict
 
 def _log_event(obj: Dict[str, Any]):
@@ -355,16 +367,25 @@ async def small_backfill(client:"BinanceClient", sym:str, tf:str):
     except Exception as e:
         log.warning("backfill_error", symbol=sym, tf=tf, error=str(e))
 
-async def periodic_derivs(client:"BinanceClient", symbols:List[str]):
-    while True:
-        try:
-            for sym in symbols[:50]:
-                fr=await client.funding_rate(sym)
-                oi=await client.open_interest_z(sym,"5m")
-                log.info("derivs", symbol=sym, funding=fr, oi_z=oi)
-        except Exception as e:
-            log.warning("derivs_poll_err", error=str(e))
-        await asyncio.sleep(60)
+async def fetch_oi_signal_ok(symbol: str) -> bool:
+    """Pass if OI z >= OI_Z_MIN OR ΔOI% >= OI_DELTA_MIN. Light but meaningful."""
+    try:
+        hist = await BINANCE_CLIENT.open_interest_hist(symbol, period=S.OI_LOOKBACK, limit=30)
+        cur  = await BINANCE_CLIENT.open_interest(symbol)
+        if not hist or cur is None: 
+            return True  # don't block if OI unavailable
+        prev = hist[:-1] if len(hist)>1 else hist
+        if len(prev)<5:
+            return True
+        mean = sum(prev)/len(prev)
+        var  = sum((x-mean)**2 for x in prev)/len(prev)
+        std  = var**0.5
+        z = 0.0 if std==0 else (cur - mean)/std
+        delta_pct = (cur-mean)/mean if mean>0 else 0.0
+        return (z >= S.OI_Z_MIN) or (delta_pct >= S.OI_DELTA_MIN)
+    except Exception as e:
+        log.warning("oi_check_error", symbol=symbol, error=str(e))
+        return True  # be permissive on transient errors
 
 # ----------- Signal handling -----------
 async def on_kline(symbol:str, k:dict):
@@ -396,36 +417,35 @@ async def on_kline(symbol:str, k:dict):
 
     # Volume filters
     buf=BE.buffers.get((sym,tf))
+    vol_ratio = 0.0
     if buf and len(buf["v"])>=max(30, S.VOL_SMA_LEN+1):
         vols=list(buf["v"])
-        # Z-score filter (existing)
+        # Z-score
         win=vols[-30:-1]
         if win:
             mean=sum(win)/len(win); var=sum((x-mean)**2 for x in win)/len(win); std=var**0.5 if var>0 else 1.0
             sig.vol_z=(vols[-1]-mean)/std
-        # NEW: SMA20 volume ratio (not strict)
+        # Extra light filter: vol/SMA20
         sma20 = sma(vols, S.VOL_SMA_LEN) or 0.0
         vol_ratio = (vols[-1] / sma20) if sma20 > 0 else 0.0
-    else:
-        sig.vol_z = sig.vol_z if hasattr(sig, "vol_z") else 0.0
-        vol_ratio = 0.0
 
-    # Filters
+    # Basic filters
     if not getattr(sig,"htf_bias_ok",True): return
     if abs(getattr(sig,"tob_imbalance",0.0))<S.TOB_IMB_MIN: return
     if (sig.spread_bp or 0)>S.SPREAD_MAX_BP: return
-    if getattr(sig,"vol_z",0.0)<S.VOL_Z_MIN: return
-    if vol_ratio < S.VOL_SMA_RATIO_MIN: return   # not strict extra volume filter
+    if getattr(sig,"vol_z",0.0)<1.5: return
+    if vol_ratio < S.VOL_SMA_RATIO_MIN: return
 
-    # 6h cooldown per symbol or skip if already open
+    # OI filter (light but meaningful)
+    if not await fetch_oi_signal_ok(sym):
+        return
+
+    # Cooldown / existing trade
     now_ts = int(time.time())
-    last_ts = LAST_SIGNAL_TS.get(sym, 0)
-    if now_ts - last_ts < S.COOLDOWN_SEC:
-        return
-    if sym in OPEN_TRADES:
-        return
+    if now_ts - LAST_SIGNAL_TS.get(sym, 0) < S.COOLDOWN_SEC: return
+    if sym in OPEN_TRADES: return
 
-    # Compute Entry/SL using ATR SL and R-based targets (1R and 2R)
+    # Compute Entry/SL, RR 1:2
     if not sig.atr_val or sig.atr_val <= 0:
         sig.atr_val = sig.price * 0.003  # fallback
     pad = S.BREAKOUT_PAD_BP / 10_000
@@ -435,48 +455,31 @@ async def on_kline(symbol:str, k:dict):
     else:
         entry = sig.price
         entry_note = "market"
-
-    # SL via ATR multiplier
-    if sig.side == "LONG":
-        sl = entry - sig.atr_val * S.ATR_SL_MULT
-    else:
-        sl = entry + sig.atr_val * S.ATR_SL_MULT
-
+    sl = entry - sig.atr_val * S.ATR_SL_MULT if sig.side=="LONG" else entry + sig.atr_val * S.ATR_SL_MULT
     risk = abs(entry - sl)
-    if risk <= 0:
-        return
+    if risk <= 0: return
+    tp1 = entry + risk if sig.side=="LONG" else entry - risk
+    tp2 = entry + 2*risk if sig.side=="LONG" else entry - 2*risk
 
-    # Targets at 1R and 2R for exact R:R=1:2
-    if sig.side == "LONG":
-        tp1 = entry + risk * 1.0
-        tp2 = entry + risk * 2.0
-    else:
-        tp1 = entry - risk * 1.0
-        tp2 = entry - risk * 2.0
-
-    # Position size (optional)
     qty_txt = "—"
     if S.ACCOUNT_EQUITY_USDT and S.ACCOUNT_EQUITY_USDT > 0:
         qty = (S.ACCOUNT_EQUITY_USDT * (S.MAX_RISK_PCT / 100.0)) / risk
         qty_txt = f"{qty:.4f}"
 
-    # Save open trade (trail only AFTER TP1)
+    # Save trade (trail only after TP1)
     OPEN_TRADES[sym] = {
         "symbol": sym, "side": sig.side, "tf": tf,
         "entry": entry, "sl": sl, "tp1": tp1, "tp2": tp2,
         "opened_ts": now_ts,
-        "tp1_hit": False,
-        "trail_active": False,
-        "trail_peak": None,     # highest (long) / lowest (short) since TP1
-        "trail_dist": sig.atr_val * S.TRAIL_ATR_MULT,  # fixed ATR distance for trailing
-        "atr_at_entry": sig.atr_val,
+        "tp1_hit": False, "trail_active": False, "trail_peak": None,
+        "trail_dist": sig.atr_val * S.TRAIL_ATR_MULT, "atr_at_entry": sig.atr_val
     }
     LAST_SIGNAL_TS[sym] = now_ts
 
     # Alert
     direction="✅ LONG" if sig.side=="LONG" else "❌ SHORT"
     tz_dt=to_tz(now_utc(), S.TZ)
-    sl_pct = _fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
+    sl_pct=_fmt_pct(sl, entry); tp1_pct=_fmt_pct(tp1, entry); tp2_pct=_fmt_pct(tp2, entry)
     text=(f"{direction} <b>{sym}</b> <code>{tf}</code>\n"
           f"Price: <b>{sig.price:.6f}</b>  Level: {sig.level:.6f}  Body: {sig.body_ratio:.2f}\n"
           f"TOB: {sig.tob_imbalance:.2f}  VolZ: {getattr(sig,'vol_z',0):.2f}  Vol/SMA{S.VOL_SMA_LEN}: {vol_ratio:.2f}  Spread(bp): {sig.spread_bp or 0:.1f}\n"
@@ -497,48 +500,34 @@ async def on_bookticker(symbol:str, data:dict):
     OB.update_book_ticker(symbol, data)
     sym = symbol.upper()
     trade = OPEN_TRADES.get(sym)
-    if not trade:
-        return
+    if not trade: return
     top = OB.top(sym)
-    if not top:
-        return
+    if not top: return
     mid = (top.ask_price + top.bid_price) / 2
-    if mid <= 0:
-        return
+    if mid <= 0: return
 
     side = trade["side"]
     entry = trade["entry"]; sl = trade["sl"]; tp1 = trade["tp1"]; tp2 = trade["tp2"]
     trail_dist = trade["trail_dist"]
 
-    # Step 1: before TP1, respect hard SL and TP1
     if not trade["tp1_hit"]:
         if side == "LONG":
-            if mid <= sl:
-                await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid <= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
             if mid >= tp1:
-                trade["tp1_hit"] = True
-                trade["trail_active"] = True
-                trade["trail_peak"] = mid
+                trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         else:
-            if mid >= sl:
-                await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
+            if mid >= sl: await _close_trade(sym, "SL", exit_price=sl, entry=entry); return
             if mid <= tp1:
-                trade["tp1_hit"] = True
-                trade["trail_active"] = True
-                trade["trail_peak"] = mid
-        # if TP1 not yet hit, nothing else to do
+                trade["tp1_hit"] = True; trade["trail_active"] = True; trade["trail_peak"] = mid
         return
 
-    # Step 2: after TP1, enable trailing stop; still allow final TP2 take profit
+    # after TP1: trail + TP2
     if side == "LONG":
-        # update peak
         if trade["trail_active"]:
             trade["trail_peak"] = max(trade["trail_peak"], mid)
             trail_stop = trade["trail_peak"] - trail_dist
-            # if price falls to trailing stop → close
             if mid <= trail_stop:
                 await _close_trade(sym, "TS", exit_price=trail_stop, entry=entry); return
-        # TP2 exit
         if mid >= tp2:
             await _close_trade(sym, "TP2", exit_price=tp2, entry=entry); return
     else:
@@ -552,8 +541,7 @@ async def on_bookticker(symbol:str, data:dict):
 
 async def _close_trade(symbol: str, outcome: str, exit_price: float, entry: float):
     trade = OPEN_TRADES.pop(symbol, None)
-    if not trade:
-        return
+    if not trade: return
     pl_pct = _fmt_pct(exit_price, entry)
     dur_min = (int(time.time()) - trade["opened_ts"]) / 60.0
     msg = (f"📌 <b>RESULT</b> {symbol}\n"
@@ -573,32 +561,30 @@ async def alert(text:str, symbol:str):
     STATE["last_alert"]={"symbol":symbol,"text":text,"ts":int(time.time())}
 
 async def main():
+    global REST_SESSION, BINANCE_CLIENT
     log.info("boot", tfs=S.TIMEFRAMES, cooldown_sec=S.COOLDOWN_SEC, rr="1:2", trailing_after_tp1=True)
     # Health server
     hs=HealthServer(S.HOST, S.PORT, STATE)
     asyncio.create_task(asyncio.to_thread(hs.run))
-    async with aiohttp.ClientSession() as sess:
-        from_types = (list, tuple)
-        # Discover symbols if ALL
-        if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
-            symbols=await discover_perp_usdt_symbols(sess, S.MAX_SYMBOLS)
-        elif isinstance(S.SYMBOLS, from_types):
-            symbols=list(S.SYMBOLS)
-        else:
-            symbols=[str(S.SYMBOLS)]
-        STATE["symbols"]=symbols
-        log.info("symbols_selected", count=len(symbols))
-        # Backfill
-        from_types = (list, tuple)
-        client=BinanceClient(sess)
-        for i, sym in enumerate(symbols):
-            for tf in S.TIMEFRAMES:
-                await small_backfill(client, sym, tf)
-            if i % 10 == 0:
-                await asyncio.sleep(0.2)
-        asyncio.create_task(periodic_derivs(client, symbols))
+    REST_SESSION = aiohttp.ClientSession()
+    BINANCE_CLIENT = BinanceClient(REST_SESSION)
+    # Discover symbols
+    if S.SYMBOLS=="ALL" or (isinstance(S.SYMBOLS,str) and S.SYMBOLS.upper()=="ALL"):
+        symbols=await discover_perp_usdt_symbols(REST_SESSION, S.MAX_SYMBOLS)
+    elif isinstance(S.SYMBOLS, (list, tuple)):
+        symbols=list(S.SYMBOLS)
+    else:
+        symbols=[str(S.SYMBOLS)]
+    STATE["symbols"]=symbols
+    log.info("symbols_selected", count=len(symbols))
+    # Backfill
+    for i, sym in enumerate(symbols):
+        for tf in S.TIMEFRAMES:
+            await small_backfill(BINANCE_CLIENT, sym, tf)
+        if i % 10 == 0:
+            await asyncio.sleep(0.2)
     # WS streams chunked
-    ws_multi=WSStreamMulti(STATE["symbols"], S.TIMEFRAMES, on_kline, on_bookticker, chunk_size=S.WS_CHUNK_SIZE)
+    ws_multi=WSStreamMulti(symbols, S.TIMEFRAMES, on_kline, on_bookticker, chunk_size=S.WS_CHUNK_SIZE)
     await ws_multi.run()
 
 if __name__=="__main__":

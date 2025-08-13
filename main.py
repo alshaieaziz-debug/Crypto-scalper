@@ -27,6 +27,7 @@ HARD_REQUIRE_OI   = os.getenv("HARD_REQUIRE_OI","false").lower()=="true"
 CORR_HARD_BLOCK   = os.getenv("CORR_HARD_BLOCK","false").lower()=="true"
 COOLDOWN_SEC      = int(os.getenv("COOLDOWN_SEC","180"))     # per pair/tf alert cooldown
 MAX_RISK_PCT      = float(os.getenv("MAX_RISK_PCT","0.008")) # 0.8% max stop distance
+HARD_REQUIRE_OB   = os.getenv("HARD_REQUIRE_OB","false").lower()=="true"  # ← NEW
 
 # Stats & reporting
 DEDUP_MIN          = int(os.getenv("DEDUP_MIN", "5"))         # within N minutes treat same idea as duplicate (stats only)
@@ -38,12 +39,12 @@ BINANCE_BASE = "https://fapi.binance.com"
 RIYADH_TZ = timezone(timedelta(hours=3))  # no DST
 
 # ========= TIMEFRAMES =========
-# Per your request: replace 1m with 5m using the same logic/thresholds. We now scan 5m and 15m.
+# Per your request earlier: replaced 1m with 5m; scanning 5m and 15m.
 TIMEFRAMES = ["5m","15m"]
 
 # ========= STATE =========
 def make_buf():
-    # keep 20-period vols/highs/lows, 21 closes (for recent range), plus opens for OB detection
+    # keep 20-period vols/highs/lows, 21 closes/opens for range + OB detection
     return {'vol': deque(maxlen=20), 'hi': deque(maxlen=20), 'lo': deque(maxlen=20),
             'cl': deque(maxlen=21), 'op': deque(maxlen=21), 'last_close': None}
 
@@ -101,7 +102,6 @@ def next_close_ms(tf):
     if tf=="1m":  return (s - (s%60) + 60)*1000
     if tf=="5m":  return (s - (s%300) + 300)*1000
     if tf=="15m": return (s - (s%900) + 900)*1000
-    # fallback
     return (s - (s%300) + 300)*1000
 
 def swing_levels(lows, highs):
@@ -278,9 +278,8 @@ async def correlation_soft_flag(session, direction):
 # ========= SESSION VOL (SOFT) =========
 def session_soft_flag(tf, closes):
     if len(closes) < 20: return True  # cautious
-    rets = [abs((closes[i]-closes[i-1])/closes[i-1]) for i in range(1,len(closes))]
-    atrp = sum(rets[-20:])/20.0
-    # thresholds tuned (kept same spirit; 5m ~0.35%, 15m ~0.60%)
+    rets = [abs((closes i - closes[i-1]) / closes[i-1]) for i in range(1, len(closes))]
+    atrp = sum(rets[-20:]) / 20.0
     th_map = {"5m":0.0035, "15m":0.0060}
     th = th_map.get(tf, 0.0035)
     return atrp < th
@@ -304,13 +303,13 @@ def depth_checks(orderbook, price):
     except Exception:
         return False, 1.0, 0.0
 
-# ========= ORDER BLOCK (OB) CONFIRMATION (SOFT) =========
+# ========= ORDER BLOCK (OB) CONFIRMATION (SOFT/HARD) =========
 def ob_confirmation(buf, direction, entry):
     """
-    Very lightweight OB heuristic (last ~12 candles):
-      • Bullish (demand) OB: most-recent bearish candle that swept recent lows.
-      • Bearish (supply) OB: most-recent bullish candle that swept recent highs.
-    If found, returns (True, "🧱OB✅"); else (False, "🧱OB✖").
+    Lightweight OB heuristic over last ~12 candles:
+      • Bullish (demand) OB: most-recent bearish candle sweeping recent lows.
+      • Bearish (supply) OB: most-recent bullish candle sweeping recent highs.
+    Returns (has_ob: bool, tag: str).
     """
     hi = list(buf['hi']); lo = list(buf['lo'])
     op = list(buf['op']); cl = list(buf['cl'])
@@ -320,16 +319,14 @@ def ob_confirmation(buf, direction, entry):
     lookback = min(12, n-1)
 
     if direction == "Long":
-        # find most recent bearish candle that made/swept a local low
         recent_low = min(lo[max(0, n-lookback-1):n-1])
         for i in range(n-2, max(-1, n-lookback-2), -1):
             if cl[i] < op[i] and lo[i] <= recent_low:
-                # optional proximity check (entry not far above OB open)
-                if entry >= op[i] and (entry - lo[i]) / max(1e-9, entry) <= 0.01:  # within ~1%
+                # optional proximity check (entry not far above OB)
+                if entry >= op[i] and (entry - lo[i]) / max(1e-9, entry) <= 0.01:
                     return True, "🧱OB✅"
                 return True, "🧱OB✅"
         return False, "🧱OB✖"
-
     else:  # Short
         recent_high = max(hi[max(0, n-lookback-1):n-1])
         for i in range(n-2, max(-1, n-lookback-2), -1):
@@ -484,8 +481,10 @@ async def scan_loop(session, symbols, tf):
                     if sig['direction']=="Short" and (btc5m >  0.007 or eth5m >  0.007):
                         return
 
-                # --- OB confirmation (soft) ---
+                # --- OB confirmation (soft/hard) ---
                 has_ob, ob_tag = ob_confirmation(buf, sig['direction'], entry)
+                if HARD_REQUIRE_OB and not has_ob:
+                    return  # block if OB is mandatory and missing
 
                 # --- Debounce per symbol/tf ---
                 now_s = int(time.time())
@@ -514,7 +513,7 @@ async def scan_loop(session, symbols, tf):
                     score -= 1; info_bits.append("🌫️Session soft")
                 else:
                     score += 1; info_bits.append("🌞Session OK")
-                # OB confirmation
+                # OB confirmation (soft scoring even if not mandatory)
                 if has_ob:
                     score += 1; info_bits.append(ob_tag)
                 else:
@@ -531,7 +530,6 @@ async def scan_loop(session, symbols, tf):
                 key = trade_key(sym, tf, sig['direction'], entry)
                 nowm = now_ms()
                 is_unique = True
-                # prune old dedup keys
                 while dedup_seen and nowm - dedup_seen[0][1] > DEDUP_MIN*60*1000:
                     dedup_seen.pop(0)
                 for k, ts in dedup_seen:
@@ -541,8 +539,7 @@ async def scan_loop(session, symbols, tf):
                 if is_unique:
                     dedup_seen.append((key, nowm))
                     stats["unique"] += 1
-                    current_day_keys.add(key)  # track for today's digest
-                    # register active trade for resolution
+                    current_day_keys.add(key)
                     active_trades[key] = {
                         "symbol": sym, "tf": tf, "direction": sig['direction'],
                         "entry": entry, "sl": sl, "tp1": tp1, "start_ms": nowm
@@ -559,7 +556,6 @@ async def scan_loop(session, symbols, tf):
 
 # ========= RESULT RESOLVER (TP1 vs SL) =========
 async def result_resolver_loop(session):
-    # checks active_trades periodically and updates stats when TP/SL is hit
     while True:
         if not active_trades:
             await asyncio.sleep(5)
@@ -587,7 +583,6 @@ async def result_resolver_loop(session):
                 bid = float(jt["bidPrice"]); ask = float(jt["askPrice"])
 
                 if direction == "Long":
-                    # win if bid >= tp1 first, loss if ask <= sl first
                     if bid >= tp1:
                         if k in current_day_keys:
                             stats["wins"] += 1
@@ -599,7 +594,6 @@ async def result_resolver_loop(session):
                         del active_trades[k]
                         await tg_send(session, format_result(sym, tr["tf"], direction, "LOSS (SL hit)", entry, sl, tp1))
                 else:
-                    # Short: win if ask <= tp1, loss if bid >= sl
                     if ask <= tp1:
                         if k in current_day_keys:
                             stats["wins"] += 1
@@ -618,23 +612,14 @@ async def daily_stats_loop(session):
     while True:
         sleep_s, target_dt = seconds_until_riyadh(STATS_DAILY_HOUR, 0)
         await asyncio.sleep(sleep_s)
-        # Compose period string: 22:00 yesterday -> 22:00 today
         today_2200 = target_dt
         yesterday_2200 = today_2200 - timedelta(days=1)
         period_str = f"{yesterday_2200.strftime('%Y-%m-%d %H:%M')} → {today_2200.strftime('%Y-%m-%d %H:%M')} (Riyadh)"
-
-        # Build & send daily digest
         line = format_stats_line()
         msg = f"🗓️ *DAILY STATS*\nPeriod: {period_str}\n{line}"
         await tg_send(session, msg)
-
-        # Reset for next day window
-        stats["unique"] = 0
-        stats["wins"] = 0
-        stats["losses"] = 0
+        stats["unique"] = 0; stats["wins"] = 0; stats["losses"] = 0
         current_day_keys.clear()
-        # Note: do NOT clear active_trades; if older trades resolve after the cutoff,
-        # they won't be counted in the new day's stats.
 
 # ========= WEB HEALTH =========
 async def health(_): return web.Response(text="ok ✅")

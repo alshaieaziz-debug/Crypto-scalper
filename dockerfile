@@ -1,32 +1,23 @@
-# Use a small Python image
+# Use slim python image
 FROM python:3.11-slim
 
-# Set envs
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    TZ=Asia/Riyadh
+# Set working directory
+WORKDIR /app
 
 # Install system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates tzdata curl \
- && rm -rf /var/lib/apt/lists/*
+    gcc g++ make libffi-dev libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
 
-# Set work dir
-WORKDIR /app
+# Install pip dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy your bot file into the image
-COPY app.py /app/app.py
+# Copy source
+COPY . .
 
-# Install Python deps (match what your app uses)
-RUN pip install --upgrade pip && \
-    pip install aiohttp uvloop pydantic pydantic-settings structlog tzdata orjson
-
-# Expose port for health endpoint
+# Expose healthcheck port
 EXPOSE 8080
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
-  CMD curl -fsS "http://127.0.0.1:${PORT:-8080}/healthz" || exit 1
-
-# Run the bot
+# Run app
 CMD ["python", "app.py"]

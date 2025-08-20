@@ -20,4 +20,4 @@ COPY . .
 EXPOSE 8080
 
 # Run app
-CMD ["python", "app.py"]
+CMD ["python", "main.py"]
